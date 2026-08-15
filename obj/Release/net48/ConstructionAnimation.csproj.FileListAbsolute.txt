@@ -1,0 +1,9 @@
+C:\Dev\ConstructionAnimation\bin\Release\net48\ConstructionAnimation.dll
+C:\Dev\ConstructionAnimation\bin\Release\net48\ConstructionAnimation.pdb
+C:\Dev\ConstructionAnimation\obj\Release\net48\ConstructionAnimation.csproj.AssemblyReference.cache
+C:\Dev\ConstructionAnimation\obj\Release\net48\ConstructionAnimation.GeneratedMSBuildEditorConfig.editorconfig
+C:\Dev\ConstructionAnimation\obj\Release\net48\ConstructionAnimation.AssemblyInfoInputs.cache
+C:\Dev\ConstructionAnimation\obj\Release\net48\ConstructionAnimation.AssemblyInfo.cs
+C:\Dev\ConstructionAnimation\obj\Release\net48\ConstructionAnimation.csproj.CoreCompileInputs.cache
+C:\Dev\ConstructionAnimation\obj\Release\net48\ConstructionAnimation.dll
+C:\Dev\ConstructionAnimation\obj\Release\net48\ConstructionAnimation.pdb

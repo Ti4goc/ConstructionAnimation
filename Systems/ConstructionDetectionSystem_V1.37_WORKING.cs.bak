@@ -1,0 +1,3714 @@
+using Colossal.IO.AssetDatabase;
+using Game;
+using Game.Buildings;
+using Game.Common;
+using Game.Objects;
+using Game.Prefabs;
+using Game.Rendering;
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using Unity.Collections;
+using Unity.Entities;
+using Unity.Mathematics;
+using UnityEngine;
+
+namespace ConstructionAnimation.Systems
+{
+    public partial class ConstructionDetectionSystem : GameSystemBase
+    {
+        // ============================================================
+        // QUERY / PREFABS
+        // ============================================================
+
+        private EntityQuery m_BuildingQuery;
+        private PrefabSystem m_PrefabSystem;
+
+        // ============================================================
+        // PER-BUILDING STATE
+        // ============================================================
+
+        private sealed class ConstructionVisual
+        {
+            public Entity Source = Entity.Null;
+            public Entity Proxy = Entity.Null;
+
+            public float BuildingHeight = 20f;
+
+            public float3 BuildingSize =
+                new float3(
+                    20f,
+                    20f,
+                    20f
+                );
+
+            public float3 GeometryPivot =
+                float3.zero;
+
+            public List<Vector2> Footprint =
+                new List<Vector2>();
+
+            public List<float> FloorBoundaries =
+                new List<float>();
+
+            public GameObject ScaffoldRoot;
+
+            public List<GameObject> ScaffoldLevels =
+                new List<GameObject>();
+
+            public List<float> ScaffoldLevelBottoms =
+                new List<float>();
+
+            public List<float> ScaffoldLevelHeights =
+                new List<float>();
+
+            public float ScaffoldHeight;
+
+            // ========================================================
+            // SMOOTH VISUAL PROGRESS
+            // ========================================================
+
+            public float VisualProgress;
+            public float VisualProgressVelocity;
+
+            public byte LastProgress = 255;
+
+            public bool SeenThisFrame;
+        }
+
+        private sealed class PendingProxyDestroy
+        {
+            public Entity Entity = Entity.Null;
+            public int Frames;
+        }
+
+        private readonly Dictionary<Entity, ConstructionVisual>
+            m_Visuals =
+                new Dictionary<Entity, ConstructionVisual>();
+
+        private readonly List<Entity>
+            m_RemoveSources =
+                new List<Entity>();
+
+        private readonly List<PendingProxyDestroy>
+            m_PendingProxyDestroys =
+                new List<PendingProxyDestroy>();
+
+        // ============================================================
+        // MATERIALS
+        // ============================================================
+
+        private Material m_ScaffoldMetalMaterial;
+        private Material m_ScaffoldDeckMaterial;
+
+        // ============================================================
+        // CONSTANTS
+        // ============================================================
+
+        private const int ProxyDestroyDelayFrames = 4;
+
+        private const float ScaffoldMargin = 1.10f;
+
+        private const float ScaffoldBayWidth = 3.0f;
+
+        private const float ScaffoldBeamThickness = 0.10f;
+
+        private const float ScaffoldDeckDepth = 0.85f;
+        private const float ScaffoldDeckThickness = 0.12f;
+
+        private const float ScaffoldGroundOffset = 0.05f;
+
+        // ============================================================
+        // V1.38 ANIMATION
+        // ============================================================
+
+        // Base smoothing for a building around 20m high.
+        private const float ProgressSmoothTime = 0.55f;
+
+        // Scaffold stays only slightly above the visible building.
+        private const float ScaffoldHeightLead = 0.50f;
+
+        // Dismantling begins only close to completion.
+        private const float ScaffoldDismantleStart = 0.92f;
+
+        // Used only if floor detection fails.
+        private const float FallbackTargetFloorHeight = 2.75f;
+
+        private const float WindowRowTolerance = 0.35f;
+
+        // ============================================================
+        // CREATE
+        // ============================================================
+
+        protected override void OnCreate()
+        {
+            base.OnCreate();
+
+            m_PrefabSystem =
+                World.GetOrCreateSystemManaged<PrefabSystem>();
+
+            m_BuildingQuery =
+                GetEntityQuery(
+                    ComponentType.ReadOnly<UnderConstruction>(),
+                    ComponentType.ReadOnly<Building>(),
+                    ComponentType.ReadOnly<PrefabRef>(),
+                    ComponentType.ReadOnly<Game.Objects.Transform>()
+                );
+
+            CreateScaffoldMaterials();
+
+            ModLog.Info(
+                "ConstructionAnimation V1.38 height-synchronised smooth construction created."
+            );
+        }
+
+        // ============================================================
+        // UPDATE
+        // ============================================================
+
+        protected override void OnUpdate()
+        {
+            ProcessPendingProxyDestroys();
+
+            foreach (
+                ConstructionVisual visual
+                in m_Visuals.Values
+            )
+            {
+                visual.SeenThisFrame =
+                    false;
+            }
+
+            using NativeArray<Entity> buildings =
+                m_BuildingQuery.ToEntityArray(
+                    Allocator.Temp
+                );
+
+            // --------------------------------------------------------
+            // ALL simultaneous constructions.
+            // --------------------------------------------------------
+
+            for (
+                int i = 0;
+                i < buildings.Length;
+                i++
+            )
+            {
+                Entity source =
+                    buildings[i];
+
+                if (
+                    source == Entity.Null ||
+                    !EntityManager.Exists(
+                        source
+                    )
+                )
+                {
+                    continue;
+                }
+
+                ConstructionVisual visual;
+
+                if (
+                    !m_Visuals.TryGetValue(
+                        source,
+                        out visual
+                    )
+                )
+                {
+                    visual =
+                        CreateConstructionVisual(
+                            source
+                        );
+
+                    if (
+                        visual == null
+                    )
+                    {
+                        continue;
+                    }
+
+                    m_Visuals.Add(
+                        source,
+                        visual
+                    );
+                }
+
+                visual.SeenThisFrame =
+                    true;
+
+                UpdateConstructionVisual(
+                    visual
+                );
+            }
+
+            // --------------------------------------------------------
+            // Finished / demolished constructions.
+            // --------------------------------------------------------
+
+            m_RemoveSources.Clear();
+
+            foreach (
+                KeyValuePair<Entity, ConstructionVisual> pair
+                in m_Visuals
+            )
+            {
+                if (
+                    !pair.Value.SeenThisFrame
+                )
+                {
+                    m_RemoveSources.Add(
+                        pair.Key
+                    );
+                }
+            }
+
+            for (
+                int i = 0;
+                i < m_RemoveSources.Count;
+                i++
+            )
+            {
+                Entity source =
+                    m_RemoveSources[i];
+
+                ConstructionVisual visual;
+
+                if (
+                    !m_Visuals.TryGetValue(
+                        source,
+                        out visual
+                    )
+                )
+                {
+                    continue;
+                }
+
+                DestroyConstructionVisual(
+                    visual
+                );
+
+                m_Visuals.Remove(
+                    source
+                );
+            }
+        }
+
+        // ============================================================
+        // CREATE CONSTRUCTION
+        // ============================================================
+
+        private ConstructionVisual CreateConstructionVisual(
+            Entity source
+        )
+        {
+            try
+            {
+                ConstructionVisual visual =
+                    new ConstructionVisual();
+
+                visual.Source =
+                    source;
+
+                PrefabRef prefabRef =
+                    EntityManager.GetComponentData<PrefabRef>(
+                        source
+                    );
+
+                UnderConstruction construction =
+                    EntityManager.GetComponentData<UnderConstruction>(
+                        source
+                    );
+
+                // Do not animate from zero if mod sees an existing
+                // construction already in progress.
+                visual.VisualProgress =
+                    math.saturate(
+                        construction.m_Progress /
+                        100f
+                    );
+
+                visual.VisualProgressVelocity =
+                    0f;
+
+                ReadBuildingGeometry(
+                    prefabRef.m_Prefab,
+                    visual
+                );
+
+                AnalyseBuildingMeshes(
+                    prefabRef.m_Prefab,
+                    visual
+                );
+
+                if (
+                    visual.Footprint == null ||
+                    visual.Footprint.Count < 3
+                )
+                {
+                    visual.Footprint =
+                        CreateFallbackFootprint(
+                            visual
+                        );
+                }
+
+                if (
+                    visual.FloorBoundaries == null ||
+                    visual.FloorBoundaries.Count < 2
+                )
+                {
+                    visual.FloorBoundaries =
+                        CreateFallbackFloors(
+                            visual.BuildingHeight
+                        );
+                }
+
+                CreateNativeProxy(
+                    visual,
+                    prefabRef
+                );
+
+                CreateScaffold(
+                    visual
+                );
+
+                ModLog.Info(
+                    $"V1.38 construction added " +
+                    $"{source.Index}:{source.Version}; " +
+                    $"progress={construction.m_Progress}%; " +
+                    $"visualProgress={visual.VisualProgress:0.000}; " +
+                    $"floors={visual.FloorBoundaries.Count - 1}; " +
+                    $"height={visual.BuildingHeight:0.00}m"
+                );
+
+                return visual;
+            }
+            catch (Exception ex)
+            {
+                ModLog.Error(
+                    $"V1.38 CreateConstructionVisual failed: {ex}"
+                );
+
+                return null;
+            }
+        }
+
+        // ============================================================
+        // BASIC GEOMETRY
+        // ============================================================
+
+        private void ReadBuildingGeometry(
+            Entity prefab,
+            ConstructionVisual visual
+        )
+        {
+            visual.BuildingHeight =
+                20f;
+
+            visual.BuildingSize =
+                new float3(
+                    20f,
+                    20f,
+                    20f
+                );
+
+            visual.GeometryPivot =
+                float3.zero;
+
+            try
+            {
+                if (
+                    !EntityManager.HasComponent<ObjectGeometryData>(
+                        prefab
+                    )
+                )
+                {
+                    return;
+                }
+
+                ObjectGeometryData geometry =
+                    EntityManager.GetComponentData<ObjectGeometryData>(
+                        prefab
+                    );
+
+                visual.BuildingSize =
+                    geometry.m_Size;
+
+                visual.GeometryPivot =
+                    geometry.m_Pivot;
+
+                if (
+                    geometry.m_Size.y > 0.5f &&
+                    geometry.m_Size.y < 1000f
+                )
+                {
+                    visual.BuildingHeight =
+                        geometry.m_Size.y;
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLog.Info(
+                    $"V1.38 geometry read failed: " +
+                    $"{ex.GetType().Name}"
+                );
+            }
+        }
+
+        // ============================================================
+        // BUILDING MESH ANALYSIS
+        // ============================================================
+
+        private void AnalyseBuildingMeshes(
+            Entity buildingPrefab,
+            ConstructionVisual visual
+        )
+        {
+            List<Vector2> footprintPoints =
+                new List<Vector2>();
+
+            List<float> windowRowCandidates =
+                new List<float>();
+
+            float globalMinY =
+                float.MaxValue;
+
+            try
+            {
+                if (
+                    !EntityManager.HasBuffer<SubMesh>(
+                        buildingPrefab
+                    )
+                )
+                {
+                    return;
+                }
+
+                DynamicBuffer<SubMesh> subMeshes =
+                    EntityManager.GetBuffer<SubMesh>(
+                        buildingPrefab
+                    );
+
+                for (
+                    int subIndex = 0;
+                    subIndex < subMeshes.Length;
+                    subIndex++
+                )
+                {
+                    SubMesh subMesh =
+                        subMeshes[subIndex];
+
+                    Entity renderPrefabEntity =
+                        subMesh.m_SubMesh;
+
+                    if (
+                        renderPrefabEntity == Entity.Null ||
+                        !EntityManager.Exists(
+                            renderPrefabEntity
+                        )
+                    )
+                    {
+                        continue;
+                    }
+
+                    PrefabBase managedPrefab;
+
+                    try
+                    {
+                        managedPrefab =
+                            m_PrefabSystem.GetPrefab<PrefabBase>(
+                                renderPrefabEntity
+                            );
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (
+                        managedPrefab == null
+                    )
+                    {
+                        continue;
+                    }
+
+                    GeometryAsset geometryAsset =
+                        GetGeometryAsset(
+                            managedPrefab
+                        );
+
+                    if (
+                        geometryAsset == null
+                    )
+                    {
+                        continue;
+                    }
+
+                    Mesh[] meshes =
+                        null;
+
+                    try
+                    {
+                        meshes =
+                            geometryAsset.ObtainMeshes(
+                                true
+                            );
+
+                        if (
+                            meshes == null ||
+                            meshes.Length == 0
+                        )
+                        {
+                            continue;
+                        }
+
+                        // ------------------------------------------------
+                        // Main mesh.
+                        // ------------------------------------------------
+
+                        Mesh mainMesh =
+                            meshes[0];
+
+                        if (
+                            mainMesh != null
+                        )
+                        {
+                            Vector3[] vertices =
+                                mainMesh.vertices;
+
+                            for (
+                                int vertexIndex = 0;
+                                vertexIndex < vertices.Length;
+                                vertexIndex++
+                            )
+                            {
+                                Vector3 v =
+                                    vertices[vertexIndex];
+
+                                float3 local =
+                                    new float3(
+                                        v.x,
+                                        v.y,
+                                        v.z
+                                    );
+
+                                local =
+                                    math.rotate(
+                                        subMesh.m_Rotation,
+                                        local
+                                    );
+
+                                local +=
+                                    subMesh.m_Position;
+
+                                footprintPoints.Add(
+                                    new Vector2(
+                                        local.x,
+                                        local.z
+                                    )
+                                );
+
+                                globalMinY =
+                                    math.min(
+                                        globalMinY,
+                                        local.y
+                                    );
+                            }
+                        }
+
+                        // ------------------------------------------------
+                        // Prefer dedicated window mesh.
+                        // ------------------------------------------------
+
+                        if (
+                            meshes.Length >= 3 &&
+                            meshes[2] != null
+                        )
+                        {
+                            ExtractWindowComponentCenters(
+                                meshes[2],
+                                subMesh,
+                                windowRowCandidates
+                            );
+                        }
+                        else if (
+                            meshes.Length >= 2 &&
+                            meshes[1] != null
+                        )
+                        {
+                            ExtractWindowComponentCenters(
+                                meshes[1],
+                                subMesh,
+                                windowRowCandidates
+                            );
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ModLog.Info(
+                            $"V1.38 mesh analysis failed: " +
+                            $"{ex.GetType().Name}"
+                        );
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            geometryAsset.ReleaseMeshes();
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLog.Info(
+                    $"V1.38 AnalyseBuildingMeshes failed: " +
+                    $"{ex.GetType().Name}"
+                );
+            }
+
+            // --------------------------------------------------------
+            // FOOTPRINT
+            // --------------------------------------------------------
+
+            if (
+                footprintPoints.Count >= 3
+            )
+            {
+                List<Vector2> hull =
+                    CalculateConvexHull(
+                        footprintPoints
+                    );
+
+                visual.Footprint =
+                    SimplifyHull(
+                        hull
+                    );
+            }
+
+            // --------------------------------------------------------
+            // FLOORS
+            // --------------------------------------------------------
+
+            if (
+                globalMinY != float.MaxValue &&
+                windowRowCandidates.Count > 0
+            )
+            {
+                List<float> normalizedRows =
+                    new List<float>();
+
+                for (
+                    int i = 0;
+                    i < windowRowCandidates.Count;
+                    i++
+                )
+                {
+                    float normalized =
+                        windowRowCandidates[i] -
+                        globalMinY;
+
+                    if (
+                        normalized > 0.25f &&
+                        normalized <
+                        visual.BuildingHeight + 1f
+                    )
+                    {
+                        normalizedRows.Add(
+                            normalized
+                        );
+                    }
+                }
+
+                List<float> rows =
+                    ClusterHeights(
+                        normalizedRows,
+                        WindowRowTolerance
+                    );
+
+                if (
+                    rows.Count >= 2
+                )
+                {
+                    visual.FloorBoundaries =
+                        BuildFloorBoundariesFromWindowRows(
+                            rows,
+                            visual.BuildingHeight
+                        );
+
+                    LogDetectedFloors(
+                        visual,
+                        rows
+                    );
+                }
+            }
+        }
+
+        // ============================================================
+        // WINDOW COMPONENT CENTRES
+        // ============================================================
+
+        private void ExtractWindowComponentCenters(
+            Mesh mesh,
+            SubMesh subMesh,
+            List<float> output
+        )
+        {
+            if (
+                mesh == null ||
+                output == null
+            )
+            {
+                return;
+            }
+
+            Vector3[] vertices;
+            int[] triangles;
+
+            try
+            {
+                vertices =
+                    mesh.vertices;
+
+                triangles =
+                    mesh.triangles;
+            }
+            catch
+            {
+                return;
+            }
+
+            if (
+                vertices == null ||
+                vertices.Length == 0
+            )
+            {
+                return;
+            }
+
+            if (
+                triangles == null ||
+                triangles.Length < 3
+            )
+            {
+                for (
+                    int i = 0;
+                    i < vertices.Length;
+                    i++
+                )
+                {
+                    float3 local =
+                        new float3(
+                            vertices[i].x,
+                            vertices[i].y,
+                            vertices[i].z
+                        );
+
+                    local =
+                        math.rotate(
+                            subMesh.m_Rotation,
+                            local
+                        );
+
+                    local +=
+                        subMesh.m_Position;
+
+                    output.Add(
+                        local.y
+                    );
+                }
+
+                return;
+            }
+
+            int vertexCount =
+                vertices.Length;
+
+            int[] parent =
+                new int[vertexCount];
+
+            for (
+                int i = 0;
+                i < vertexCount;
+                i++
+            )
+            {
+                parent[i] =
+                    i;
+            }
+
+            for (
+                int i = 0;
+                i + 2 < triangles.Length;
+                i += 3
+            )
+            {
+                int a =
+                    triangles[i];
+
+                int b =
+                    triangles[i + 1];
+
+                int c =
+                    triangles[i + 2];
+
+                if (
+                    a < 0 ||
+                    a >= vertexCount ||
+                    b < 0 ||
+                    b >= vertexCount ||
+                    c < 0 ||
+                    c >= vertexCount
+                )
+                {
+                    continue;
+                }
+
+                Union(
+                    parent,
+                    a,
+                    b
+                );
+
+                Union(
+                    parent,
+                    b,
+                    c
+                );
+
+                Union(
+                    parent,
+                    c,
+                    a
+                );
+            }
+
+            Dictionary<int, float> minY =
+                new Dictionary<int, float>();
+
+            Dictionary<int, float> maxY =
+                new Dictionary<int, float>();
+
+            Dictionary<int, int> counts =
+                new Dictionary<int, int>();
+
+            for (
+                int i = 0;
+                i < vertexCount;
+                i++
+            )
+            {
+                int root =
+                    FindRoot(
+                        parent,
+                        i
+                    );
+
+                float3 local =
+                    new float3(
+                        vertices[i].x,
+                        vertices[i].y,
+                        vertices[i].z
+                    );
+
+                local =
+                    math.rotate(
+                        subMesh.m_Rotation,
+                        local
+                    );
+
+                local +=
+                    subMesh.m_Position;
+
+                if (
+                    !minY.ContainsKey(
+                        root
+                    )
+                )
+                {
+                    minY[root] =
+                        local.y;
+
+                    maxY[root] =
+                        local.y;
+
+                    counts[root] =
+                        1;
+                }
+                else
+                {
+                    minY[root] =
+                        math.min(
+                            minY[root],
+                            local.y
+                        );
+
+                    maxY[root] =
+                        math.max(
+                            maxY[root],
+                            local.y
+                        );
+
+                    counts[root]++;
+                }
+            }
+
+            foreach (
+                KeyValuePair<int, float> pair
+                in minY
+            )
+            {
+                int root =
+                    pair.Key;
+
+                float min =
+                    pair.Value;
+
+                float max =
+                    maxY[root];
+
+                float componentHeight =
+                    max -
+                    min;
+
+                int count =
+                    counts[root];
+
+                if (
+                    count < 3 ||
+                    componentHeight < 0.10f ||
+                    componentHeight > 4.5f
+                )
+                {
+                    continue;
+                }
+
+                float center =
+                    (
+                        min +
+                        max
+                    ) *
+                    0.5f;
+
+                output.Add(
+                    center
+                );
+            }
+        }
+
+        private static int FindRoot(
+            int[] parent,
+            int value
+        )
+        {
+            while (
+                parent[value] != value
+            )
+            {
+                parent[value] =
+                    parent[
+                        parent[value]
+                    ];
+
+                value =
+                    parent[value];
+            }
+
+            return value;
+        }
+
+        private static void Union(
+            int[] parent,
+            int a,
+            int b
+        )
+        {
+            int rootA =
+                FindRoot(
+                    parent,
+                    a
+                );
+
+            int rootB =
+                FindRoot(
+                    parent,
+                    b
+                );
+
+            if (
+                rootA != rootB
+            )
+            {
+                parent[rootB] =
+                    rootA;
+            }
+        }
+
+        // ============================================================
+        // HEIGHT CLUSTERING
+        // ============================================================
+
+        private static List<float> ClusterHeights(
+            List<float> input,
+            float tolerance
+        )
+        {
+            List<float> result =
+                new List<float>();
+
+            if (
+                input == null ||
+                input.Count == 0
+            )
+            {
+                return result;
+            }
+
+            input.Sort();
+
+            float sum =
+                input[0];
+
+            int count =
+                1;
+
+            float currentMean =
+                input[0];
+
+            for (
+                int i = 1;
+                i < input.Count;
+                i++
+            )
+            {
+                float value =
+                    input[i];
+
+                if (
+                    math.abs(
+                        value -
+                        currentMean
+                    ) <= tolerance
+                )
+                {
+                    sum +=
+                        value;
+
+                    count++;
+
+                    currentMean =
+                        sum /
+                        count;
+                }
+                else
+                {
+                    result.Add(
+                        currentMean
+                    );
+
+                    sum =
+                        value;
+
+                    count =
+                        1;
+
+                    currentMean =
+                        value;
+                }
+            }
+
+            result.Add(
+                currentMean
+            );
+
+            return result;
+        }
+
+        // ============================================================
+        // FLOOR BOUNDARIES
+        // ============================================================
+
+        private List<float> BuildFloorBoundariesFromWindowRows(
+            List<float> rows,
+            float buildingHeight
+        )
+        {
+            if (
+                rows == null ||
+                rows.Count < 2
+            )
+            {
+                return CreateFallbackFloors(
+                    buildingHeight
+                );
+            }
+
+            rows.Sort();
+
+            List<float> boundaries =
+                new List<float>();
+
+            boundaries.Add(
+                0f
+            );
+
+            for (
+                int i = 0;
+                i < rows.Count - 1;
+                i++
+            )
+            {
+                float boundary =
+                    (
+                        rows[i] +
+                        rows[i + 1]
+                    ) *
+                    0.5f;
+
+                if (
+                    boundary > 0.5f &&
+                    boundary <
+                    buildingHeight - 0.25f
+                )
+                {
+                    boundaries.Add(
+                        boundary
+                    );
+                }
+            }
+
+            boundaries.Add(
+                buildingHeight
+            );
+
+            List<float> cleaned =
+                new List<float>();
+
+            cleaned.Add(
+                boundaries[0]
+            );
+
+            for (
+                int i = 1;
+                i < boundaries.Count;
+                i++
+            )
+            {
+                float difference =
+                    boundaries[i] -
+                    cleaned[
+                        cleaned.Count - 1
+                    ];
+
+                if (
+                    difference >= 1.75f ||
+                    i == boundaries.Count - 1
+                )
+                {
+                    cleaned.Add(
+                        boundaries[i]
+                    );
+                }
+            }
+
+            if (
+                cleaned.Count < 2
+            )
+            {
+                return CreateFallbackFloors(
+                    buildingHeight
+                );
+            }
+
+            for (
+                int i = 0;
+                i < cleaned.Count - 1;
+                i++
+            )
+            {
+                float height =
+                    cleaned[i + 1] -
+                    cleaned[i];
+
+                if (
+                    height < 1.75f ||
+                    height > 6.5f
+                )
+                {
+                    return CreateFallbackFloors(
+                        buildingHeight
+                    );
+                }
+            }
+
+            return cleaned;
+        }
+
+        // ============================================================
+        // FALLBACK FLOORS
+        // ============================================================
+
+        private List<float> CreateFallbackFloors(
+            float buildingHeight
+        )
+        {
+            List<float> result =
+                new List<float>();
+
+            int floorCount =
+                Math.Max(
+                    1,
+                    Mathf.RoundToInt(
+                        buildingHeight /
+                        FallbackTargetFloorHeight
+                    )
+                );
+
+            float actualFloorHeight =
+                buildingHeight /
+                floorCount;
+
+            for (
+                int i = 0;
+                i <= floorCount;
+                i++
+            )
+            {
+                result.Add(
+                    actualFloorHeight *
+                    i
+                );
+            }
+
+            ModLog.Info(
+                $"V1.38 floor fallback: " +
+                $"height={buildingHeight:0.00}m, " +
+                $"floors={floorCount}, " +
+                $"each={actualFloorHeight:0.00}m"
+            );
+
+            return result;
+        }
+
+        private void LogDetectedFloors(
+            ConstructionVisual visual,
+            List<float> rows
+        )
+        {
+            string rowText =
+                "";
+
+            for (
+                int i = 0;
+                i < rows.Count;
+                i++
+            )
+            {
+                if (
+                    i > 0
+                )
+                {
+                    rowText +=
+                        ", ";
+                }
+
+                rowText +=
+                    rows[i].ToString(
+                        "0.00"
+                    );
+            }
+
+            string floorText =
+                "";
+
+            for (
+                int i = 0;
+                i < visual.FloorBoundaries.Count;
+                i++
+            )
+            {
+                if (
+                    i > 0
+                )
+                {
+                    floorText +=
+                        ", ";
+                }
+
+                floorText +=
+                    visual.FloorBoundaries[i]
+                        .ToString(
+                            "0.00"
+                        );
+            }
+
+            ModLog.Info(
+                $"V1.38 detected window rows: [{rowText}]"
+            );
+
+            ModLog.Info(
+                $"V1.38 floor boundaries: [{floorText}]"
+            );
+        }
+
+        // ============================================================
+        // FOOTPRINT FALLBACK
+        // ============================================================
+
+        private List<Vector2> CreateFallbackFootprint(
+            ConstructionVisual visual
+        )
+        {
+            float halfWidth =
+                visual.BuildingSize.x *
+                0.5f;
+
+            float halfDepth =
+                visual.BuildingSize.z *
+                0.5f;
+
+            return new List<Vector2>
+            {
+                new Vector2(
+                    -halfWidth,
+                    -halfDepth
+                ),
+
+                new Vector2(
+                    halfWidth,
+                    -halfDepth
+                ),
+
+                new Vector2(
+                    halfWidth,
+                    halfDepth
+                ),
+
+                new Vector2(
+                    -halfWidth,
+                    halfDepth
+                )
+            };
+        }
+
+        // ============================================================
+        // CONVEX HULL
+        // ============================================================
+
+        private static List<Vector2> CalculateConvexHull(
+            List<Vector2> input
+        )
+        {
+            List<Vector2> points =
+                new List<Vector2>(
+                    input
+                );
+
+            points.Sort(
+                delegate (
+                    Vector2 a,
+                    Vector2 b
+                )
+                {
+                    int x =
+                        a.x.CompareTo(
+                            b.x
+                        );
+
+                    if (
+                        x != 0
+                    )
+                    {
+                        return x;
+                    }
+
+                    return a.y.CompareTo(
+                        b.y
+                    );
+                }
+            );
+
+            List<Vector2> unique =
+                new List<Vector2>();
+
+            for (
+                int i = 0;
+                i < points.Count;
+                i++
+            )
+            {
+                if (
+                    unique.Count == 0 ||
+                    Vector2.SqrMagnitude(
+                        points[i] -
+                        unique[
+                            unique.Count - 1
+                        ]
+                    ) > 0.0025f
+                )
+                {
+                    unique.Add(
+                        points[i]
+                    );
+                }
+            }
+
+            if (
+                unique.Count <= 3
+            )
+            {
+                return unique;
+            }
+
+            List<Vector2> lower =
+                new List<Vector2>();
+
+            for (
+                int i = 0;
+                i < unique.Count;
+                i++
+            )
+            {
+                Vector2 p =
+                    unique[i];
+
+                while (
+                    lower.Count >= 2 &&
+                    Cross(
+                        lower[
+                            lower.Count - 2
+                        ],
+                        lower[
+                            lower.Count - 1
+                        ],
+                        p
+                    ) <= 0f
+                )
+                {
+                    lower.RemoveAt(
+                        lower.Count - 1
+                    );
+                }
+
+                lower.Add(
+                    p
+                );
+            }
+
+            List<Vector2> upper =
+                new List<Vector2>();
+
+            for (
+                int i = unique.Count - 1;
+                i >= 0;
+                i--
+            )
+            {
+                Vector2 p =
+                    unique[i];
+
+                while (
+                    upper.Count >= 2 &&
+                    Cross(
+                        upper[
+                            upper.Count - 2
+                        ],
+                        upper[
+                            upper.Count - 1
+                        ],
+                        p
+                    ) <= 0f
+                )
+                {
+                    upper.RemoveAt(
+                        upper.Count - 1
+                    );
+                }
+
+                upper.Add(
+                    p
+                );
+            }
+
+            lower.RemoveAt(
+                lower.Count - 1
+            );
+
+            upper.RemoveAt(
+                upper.Count - 1
+            );
+
+            lower.AddRange(
+                upper
+            );
+
+            return lower;
+        }
+
+        private static float Cross(
+            Vector2 a,
+            Vector2 b,
+            Vector2 c
+        )
+        {
+            return
+                (
+                    b.x -
+                    a.x
+                ) *
+                (
+                    c.y -
+                    a.y
+                ) -
+                (
+                    b.y -
+                    a.y
+                ) *
+                (
+                    c.x -
+                    a.x
+                );
+        }
+
+        // ============================================================
+        // HULL SIMPLIFICATION
+        // ============================================================
+
+        private static List<Vector2> SimplifyHull(
+            List<Vector2> hull
+        )
+        {
+            if (
+                hull == null ||
+                hull.Count <= 4
+            )
+            {
+                return hull;
+            }
+
+            List<Vector2> result =
+                new List<Vector2>();
+
+            for (
+                int i = 0;
+                i < hull.Count;
+                i++
+            )
+            {
+                Vector2 previous =
+                    hull[
+                        (
+                            i -
+                            1 +
+                            hull.Count
+                        ) %
+                        hull.Count
+                    ];
+
+                Vector2 current =
+                    hull[i];
+
+                Vector2 next =
+                    hull[
+                        (
+                            i +
+                            1
+                        ) %
+                        hull.Count
+                    ];
+
+                Vector2 a =
+                    current -
+                    previous;
+
+                Vector2 b =
+                    next -
+                    current;
+
+                if (
+                    a.magnitude <
+                    0.75f
+                )
+                {
+                    continue;
+                }
+
+                if (
+                    a.sqrMagnitude > 0.001f &&
+                    b.sqrMagnitude > 0.001f
+                )
+                {
+                    float dot =
+                        Vector2.Dot(
+                            a.normalized,
+                            b.normalized
+                        );
+
+                    if (
+                        dot > 0.985f
+                    )
+                    {
+                        continue;
+                    }
+                }
+
+                result.Add(
+                    current
+                );
+            }
+
+            if (
+                result.Count < 3
+            )
+            {
+                return hull;
+            }
+
+            return result;
+        }
+
+        // ============================================================
+        // SCAFFOLD OUTLINE OFFSET
+        // ============================================================
+
+        private List<Vector2> CreateScaffoldOutline(
+            List<Vector2> footprint
+        )
+        {
+            List<Vector2> result =
+                new List<Vector2>();
+
+            if (
+                footprint == null ||
+                footprint.Count < 3
+            )
+            {
+                return result;
+            }
+
+            for (
+                int i = 0;
+                i < footprint.Count;
+                i++
+            )
+            {
+                Vector2 previous =
+                    footprint[
+                        (
+                            i -
+                            1 +
+                            footprint.Count
+                        ) %
+                        footprint.Count
+                    ];
+
+                Vector2 current =
+                    footprint[i];
+
+                Vector2 next =
+                    footprint[
+                        (
+                            i +
+                            1
+                        ) %
+                        footprint.Count
+                    ];
+
+                Vector2 incoming =
+                    (
+                        current -
+                        previous
+                    ).normalized;
+
+                Vector2 outgoing =
+                    (
+                        next -
+                        current
+                    ).normalized;
+
+                Vector2 normalA =
+                    new Vector2(
+                        incoming.y,
+                        -incoming.x
+                    );
+
+                Vector2 normalB =
+                    new Vector2(
+                        outgoing.y,
+                        -outgoing.x
+                    );
+
+                Vector2 combined =
+                    normalA +
+                    normalB;
+
+                if (
+                    combined.sqrMagnitude <
+                    0.001f
+                )
+                {
+                    combined =
+                        normalB;
+                }
+
+                combined.Normalize();
+
+                float denominator =
+                    Mathf.Max(
+                        0.35f,
+                        Vector2.Dot(
+                            combined,
+                            normalB
+                        )
+                    );
+
+                float offset =
+                    ScaffoldMargin /
+                    denominator;
+
+                offset =
+                    Mathf.Min(
+                        offset,
+                        ScaffoldMargin *
+                        2.2f
+                    );
+
+                result.Add(
+                    current +
+                    combined *
+                    offset
+                );
+            }
+
+            return result;
+        }
+
+        // ============================================================
+        // GEOMETRY ASSET
+        // ============================================================
+
+        private GeometryAsset GetGeometryAsset(
+            object renderPrefab
+        )
+        {
+            if (
+                renderPrefab == null
+            )
+            {
+                return null;
+            }
+
+            try
+            {
+                FieldInfo field =
+                    renderPrefab
+                        .GetType()
+                        .GetField(
+                            "m_GeometryAsset",
+                            BindingFlags.Instance |
+                            BindingFlags.Public |
+                            BindingFlags.NonPublic
+                        );
+
+                if (
+                    field == null
+                )
+                {
+                    return null;
+                }
+
+                object reference =
+                    field.GetValue(
+                        renderPrefab
+                    );
+
+                return ConvertAssetReference<GeometryAsset>(
+                    reference
+                );
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static T ConvertAssetReference<T>(
+            object assetReference
+        )
+            where T : class
+        {
+            if (
+                assetReference == null
+            )
+            {
+                return null;
+            }
+
+            try
+            {
+                Type referenceType =
+                    assetReference.GetType();
+
+                MethodInfo[] methods =
+                    referenceType.GetMethods(
+                        BindingFlags.Static |
+                        BindingFlags.Public |
+                        BindingFlags.NonPublic
+                    );
+
+                foreach (
+                    MethodInfo method
+                    in methods
+                )
+                {
+                    if (
+                        method.Name != "op_Implicit" ||
+                        !typeof(T).IsAssignableFrom(
+                            method.ReturnType
+                        )
+                    )
+                    {
+                        continue;
+                    }
+
+                    ParameterInfo[] parameters =
+                        method.GetParameters();
+
+                    if (
+                        parameters.Length != 1
+                    )
+                    {
+                        continue;
+                    }
+
+                    return method.Invoke(
+                        null,
+                        new object[]
+                        {
+                            assetReference
+                        }
+                    ) as T;
+                }
+            }
+            catch
+            {
+            }
+
+            return null;
+        }
+
+        // ============================================================
+        // NATIVE PROXY
+        // ============================================================
+
+        private void CreateNativeProxy(
+            ConstructionVisual visual,
+            PrefabRef prefabRef
+        )
+        {
+            Entity source =
+                visual.Source;
+
+            Game.Objects.Transform transform =
+                EntityManager.GetComponentData<Game.Objects.Transform>(
+                    source
+                );
+
+            EntityArchetype archetype =
+                EntityManager.CreateArchetype(
+                    typeof(PrefabRef),
+                    typeof(Game.Objects.Transform),
+                    typeof(Game.Objects.Object),
+                    typeof(Game.Objects.ObjectGeometry),
+                    typeof(Game.Objects.Static),
+                    typeof(Created),
+                    typeof(Updated),
+                    typeof(Unity.Entities.Simulate)
+                );
+
+            Entity proxy =
+                EntityManager.CreateEntity(
+                    archetype
+                );
+
+            visual.Proxy =
+                proxy;
+
+            EntityManager.SetComponentData(
+                proxy,
+                prefabRef
+            );
+
+            EntityManager.SetComponentData(
+                proxy,
+                transform
+            );
+
+            CopyVisualComponent<CullingInfo>(
+                source,
+                proxy
+            );
+
+            CopyVisualComponent<Game.Objects.Color>(
+                source,
+                proxy
+            );
+
+            CopyVisualComponent<Game.Objects.Surface>(
+                source,
+                proxy
+            );
+
+            CopyVisualComponent<PseudoRandomSeed>(
+                source,
+                proxy
+            );
+
+            CopyMeshColorBuffer(
+                source,
+                proxy
+            );
+
+            CopyCustomMeshColorBuffer(
+                source,
+                proxy
+            );
+
+            if (
+                !EntityManager.HasBuffer<MeshBatch>(
+                    proxy
+                )
+            )
+            {
+                EntityManager.AddBuffer<MeshBatch>(
+                    proxy
+                );
+            }
+        }
+
+        // ============================================================
+        // UPDATE ONE CONSTRUCTION
+        // ============================================================
+
+        private void UpdateConstructionVisual(
+            ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null ||
+                visual.Source == Entity.Null ||
+                visual.Proxy == Entity.Null
+            )
+            {
+                return;
+            }
+
+            if (
+                !EntityManager.Exists(
+                    visual.Source
+                ) ||
+                !EntityManager.Exists(
+                    visual.Proxy
+                )
+            )
+            {
+                return;
+            }
+
+            if (
+                !EntityManager.HasComponent<UnderConstruction>(
+                    visual.Source
+                )
+            )
+            {
+                return;
+            }
+
+            Game.Objects.Transform sourceTransform =
+                EntityManager.GetComponentData<Game.Objects.Transform>(
+                    visual.Source
+                );
+
+            UnderConstruction construction =
+                EntityManager.GetComponentData<UnderConstruction>(
+                    visual.Source
+                );
+
+            float targetProgress =
+                math.saturate(
+                    construction.m_Progress /
+                    100f
+                );
+
+            // ========================================================
+            // V1.38
+            //
+            // Small buildings react faster.
+            // Tall buildings get a longer smoothing time.
+            // ========================================================
+
+            float heightFactor =
+                Mathf.Clamp(
+                    visual.BuildingHeight /
+                    20f,
+                    0.35f,
+                    2.0f
+                );
+
+            float effectiveSmoothTime =
+                ProgressSmoothTime *
+                heightFactor;
+
+            float deltaTime =
+                UnityEngine.Time.deltaTime;
+
+            if (
+                deltaTime > 0f
+            )
+            {
+                visual.VisualProgress =
+                    Mathf.SmoothDamp(
+                        visual.VisualProgress,
+                        targetProgress,
+                        ref visual.VisualProgressVelocity,
+                        effectiveSmoothTime,
+                        float.PositiveInfinity,
+                        deltaTime
+                    );
+
+                visual.VisualProgress =
+                    Mathf.Clamp01(
+                        visual.VisualProgress
+                    );
+            }
+
+            UpdateBuildingProxy(
+                visual,
+                sourceTransform,
+                visual.VisualProgress
+            );
+
+            UpdateScaffold(
+                visual,
+                sourceTransform,
+                visual.VisualProgress
+            );
+
+            LogProgress(
+                visual,
+                construction
+            );
+        }
+
+        // ============================================================
+        // SMOOTH BUILDING RISE
+        // ============================================================
+
+        private void UpdateBuildingProxy(
+            ConstructionVisual visual,
+            Game.Objects.Transform sourceTransform,
+            float visualProgress
+        )
+        {
+            if (
+                visual.Proxy == Entity.Null ||
+                !EntityManager.Exists(
+                    visual.Proxy
+                )
+            )
+            {
+                return;
+            }
+
+            // SmoothDamp already supplies temporal smoothing.
+            // Do not apply another global easing curve here.
+            float visibleProgress =
+                Mathf.Clamp01(
+                    visualProgress
+                );
+
+            float hiddenDistance =
+                visual.BuildingHeight +
+                0.5f;
+
+            float verticalOffset =
+                -hiddenDistance *
+                (
+                    1f -
+                    visibleProgress
+                );
+
+            Game.Objects.Transform proxyTransform =
+                sourceTransform;
+
+            proxyTransform.m_Position.y +=
+                verticalOffset;
+
+            EntityManager.SetComponentData(
+                visual.Proxy,
+                proxyTransform
+            );
+
+            if (
+                !EntityManager.HasComponent<Updated>(
+                    visual.Proxy
+                )
+            )
+            {
+                EntityManager.AddComponent<Updated>(
+                    visual.Proxy
+                );
+            }
+        }
+
+        // ============================================================
+        // V1.38 SCAFFOLD ANIMATION
+        //
+        // visual progress
+        //      ↓
+        // real visible building height in metres
+        //      ↓
+        // corresponding scaffold level
+        // ============================================================
+
+        private void UpdateScaffold(
+            ConstructionVisual visual,
+            Game.Objects.Transform sourceTransform,
+            float visualProgress
+        )
+        {
+            if (
+                visual.ScaffoldRoot == null ||
+                visual.ScaffoldLevels.Count == 0
+            )
+            {
+                return;
+            }
+
+            float3 position =
+                sourceTransform.m_Position;
+
+            visual.ScaffoldRoot
+                .transform
+                .position =
+                new Vector3(
+                    position.x,
+                    position.y +
+                    ScaffoldGroundOffset,
+                    position.z
+                );
+
+            quaternion q =
+                sourceTransform.m_Rotation;
+
+            visual.ScaffoldRoot
+                .transform
+                .rotation =
+                new Quaternion(
+                    q.value.x,
+                    q.value.y,
+                    q.value.z,
+                    q.value.w
+                );
+
+            int levelCount =
+                visual.ScaffoldLevels.Count;
+
+            float progress =
+                Mathf.Clamp01(
+                    visualProgress
+                );
+
+            // --------------------------------------------------------
+            // CONSTRUCTION
+            // --------------------------------------------------------
+
+            if (
+                progress <
+                ScaffoldDismantleStart
+            )
+            {
+                float buildingVisibleHeight =
+                    visual.BuildingHeight *
+                    progress;
+
+                float scaffoldVisibleHeight =
+                    Mathf.Min(
+                        visual.ScaffoldHeight,
+                        buildingVisibleHeight +
+                        ScaffoldHeightLead
+                    );
+
+                for (
+                    int levelIndex = 0;
+                    levelIndex < levelCount;
+                    levelIndex++
+                )
+                {
+                    GameObject level =
+                        visual.ScaffoldLevels[
+                            levelIndex
+                        ];
+
+                    if (
+                        level == null
+                    )
+                    {
+                        continue;
+                    }
+
+                    float floorBottom =
+                        visual.ScaffoldLevelBottoms[
+                            levelIndex
+                        ];
+
+                    float floorHeight =
+                        visual.ScaffoldLevelHeights[
+                            levelIndex
+                        ];
+
+                    float levelReveal =
+                        Mathf.Clamp01(
+                            (
+                                scaffoldVisibleHeight -
+                                floorBottom
+                            ) /
+                            Mathf.Max(
+                                floorHeight,
+                                0.01f
+                            )
+                        );
+
+                    if (
+                        levelReveal <= 0.001f
+                    )
+                    {
+                        level.SetActive(
+                            false
+                        );
+
+                        continue;
+                    }
+
+                    level.SetActive(
+                        true
+                    );
+
+                    float easedReveal =
+                        Smooth01(
+                            levelReveal
+                        );
+
+                    level.transform.localScale =
+                        new Vector3(
+                            1f,
+                            Mathf.Max(
+                                easedReveal,
+                                0.001f
+                            ),
+                            1f
+                        );
+                }
+            }
+
+            // --------------------------------------------------------
+            // DISMANTLING
+            // --------------------------------------------------------
+
+            else
+            {
+                for (
+                    int i = 0;
+                    i < levelCount;
+                    i++
+                )
+                {
+                    GameObject level =
+                        visual.ScaffoldLevels[i];
+
+                    if (
+                        level == null
+                    )
+                    {
+                        continue;
+                    }
+
+                    level.SetActive(
+                        true
+                    );
+
+                    level.transform.localScale =
+                        Vector3.one;
+                }
+
+                float descendProgress =
+                    Mathf.Clamp01(
+                        (
+                            progress -
+                            ScaffoldDismantleStart
+                        ) /
+                        (
+                            1f -
+                            ScaffoldDismantleStart
+                        )
+                    );
+
+                descendProgress =
+                    Smooth01(
+                        descendProgress
+                    );
+
+                Vector3 rootPosition =
+                    visual.ScaffoldRoot
+                        .transform
+                        .position;
+
+                rootPosition.y -=
+                    (
+                        visual.ScaffoldHeight +
+                        2f
+                    ) *
+                    descendProgress;
+
+                visual.ScaffoldRoot
+                    .transform
+                    .position =
+                    rootPosition;
+            }
+        }
+
+        // ============================================================
+        // SMOOTHSTEP
+        // ============================================================
+
+        private static float Smooth01(
+            float value
+        )
+        {
+            value =
+                Mathf.Clamp01(
+                    value
+                );
+
+            return
+                value *
+                value *
+                (
+                    3f -
+                    2f *
+                    value
+                );
+        }
+
+        // ============================================================
+        // CREATE SCAFFOLD
+        // ============================================================
+
+        private void CreateScaffold(
+            ConstructionVisual visual
+        )
+        {
+            DestroyScaffold(
+                visual
+            );
+
+            visual.ScaffoldRoot =
+                new GameObject(
+                    $"ConstructionAnimation_V1_38_Scaffold_" +
+                    $"{visual.Source.Index}"
+                );
+
+            visual.ScaffoldRoot.hideFlags =
+                HideFlags.DontSave;
+
+            List<Vector2> outline =
+                CreateScaffoldOutline(
+                    visual.Footprint
+                );
+
+            if (
+                outline.Count < 3
+            )
+            {
+                return;
+            }
+
+            if (
+                visual.FloorBoundaries == null ||
+                visual.FloorBoundaries.Count < 2
+            )
+            {
+                visual.FloorBoundaries =
+                    CreateFallbackFloors(
+                        visual.BuildingHeight
+                    );
+            }
+
+            visual.ScaffoldHeight =
+                visual.FloorBoundaries[
+                    visual.FloorBoundaries.Count - 1
+                ];
+
+            visual.ScaffoldLevels =
+                new List<GameObject>();
+
+            visual.ScaffoldLevelBottoms =
+                new List<float>();
+
+            visual.ScaffoldLevelHeights =
+                new List<float>();
+
+            int floorCount =
+                visual.FloorBoundaries.Count -
+                1;
+
+            for (
+                int levelIndex = 0;
+                levelIndex < floorCount;
+                levelIndex++
+            )
+            {
+                float bottomY =
+                    visual.FloorBoundaries[
+                        levelIndex
+                    ];
+
+                float topY =
+                    visual.FloorBoundaries[
+                        levelIndex + 1
+                    ];
+
+                float levelHeight =
+                    topY -
+                    bottomY;
+
+                if (
+                    levelHeight <= 0.20f
+                )
+                {
+                    continue;
+                }
+
+                GameObject levelRoot =
+                    new GameObject(
+                        $"ScaffoldFloor_{levelIndex + 1}"
+                    );
+
+                levelRoot.hideFlags =
+                    HideFlags.DontSave;
+
+                levelRoot.transform.SetParent(
+                    visual.ScaffoldRoot.transform,
+                    false
+                );
+
+                // Root is anchored at real floor bottom.
+                levelRoot.transform.localPosition =
+                    new Vector3(
+                        0f,
+                        bottomY,
+                        0f
+                    );
+
+                levelRoot.transform.localRotation =
+                    Quaternion.identity;
+
+                levelRoot.transform.localScale =
+                    Vector3.one;
+
+                visual.ScaffoldLevels.Add(
+                    levelRoot
+                );
+
+                visual.ScaffoldLevelBottoms.Add(
+                    bottomY
+                );
+
+                visual.ScaffoldLevelHeights.Add(
+                    levelHeight
+                );
+
+                CreateScaffoldLevel(
+                    outline,
+                    levelRoot,
+                    levelHeight
+                );
+
+                levelRoot.SetActive(
+                    false
+                );
+
+                ModLog.Info(
+                    $"V1.38 scaffold floor " +
+                    $"{levelIndex + 1}: " +
+                    $"bottom={bottomY:0.00}m " +
+                    $"height={levelHeight:0.00}m " +
+                    $"top={topY:0.00}m"
+                );
+            }
+
+            ModLog.Info(
+                $"V1.38 scaffold created: " +
+                $"source={visual.Source.Index}:" +
+                $"{visual.Source.Version}, " +
+                $"floors={visual.ScaffoldLevels.Count}, " +
+                $"height={visual.ScaffoldHeight:0.00}m"
+            );
+        }
+
+        // ============================================================
+        // CREATE ONE LOCAL SCAFFOLD FLOOR
+        // ============================================================
+
+        private void CreateScaffoldLevel(
+            List<Vector2> outline,
+            GameObject levelRoot,
+            float levelHeight
+        )
+        {
+            float bottomY =
+                0f;
+
+            float topY =
+                levelHeight;
+
+            for (
+                int edgeIndex = 0;
+                edgeIndex < outline.Count;
+                edgeIndex++
+            )
+            {
+                Vector2 a =
+                    outline[
+                        edgeIndex
+                    ];
+
+                Vector2 b =
+                    outline[
+                        (
+                            edgeIndex +
+                            1
+                        ) %
+                        outline.Count
+                    ];
+
+                Vector2 edge =
+                    b -
+                    a;
+
+                float edgeLength =
+                    edge.magnitude;
+
+                if (
+                    edgeLength <
+                    0.25f
+                )
+                {
+                    continue;
+                }
+
+                int bays =
+                    Math.Max(
+                        1,
+                        Mathf.CeilToInt(
+                            edgeLength /
+                            ScaffoldBayWidth
+                        )
+                    );
+
+                // ----------------------------------------------------
+                // VERTICAL POSTS
+                // ----------------------------------------------------
+
+                for (
+                    int bay = 0;
+                    bay <= bays;
+                    bay++
+                )
+                {
+                    float t =
+                        bay /
+                        (float)bays;
+
+                    Vector2 p =
+                        Vector2.Lerp(
+                            a,
+                            b,
+                            t
+                        );
+
+                    CreateBeamBetween(
+                        levelRoot,
+                        new Vector3(
+                            p.x,
+                            bottomY,
+                            p.y
+                        ),
+                        new Vector3(
+                            p.x,
+                            topY,
+                            p.y
+                        ),
+                        ScaffoldBeamThickness,
+                        m_ScaffoldMetalMaterial
+                    );
+                }
+
+                // Bottom rail.
+
+                CreateBeamBetween(
+                    levelRoot,
+                    new Vector3(
+                        a.x,
+                        bottomY,
+                        a.y
+                    ),
+                    new Vector3(
+                        b.x,
+                        bottomY,
+                        b.y
+                    ),
+                    ScaffoldBeamThickness,
+                    m_ScaffoldMetalMaterial
+                );
+
+                // Top rail.
+
+                CreateBeamBetween(
+                    levelRoot,
+                    new Vector3(
+                        a.x,
+                        topY,
+                        a.y
+                    ),
+                    new Vector3(
+                        b.x,
+                        topY,
+                        b.y
+                    ),
+                    ScaffoldBeamThickness,
+                    m_ScaffoldMetalMaterial
+                );
+
+                // ----------------------------------------------------
+                // X BRACES
+                // ----------------------------------------------------
+
+                for (
+                    int bay = 0;
+                    bay < bays;
+                    bay++
+                )
+                {
+                    Vector2 p0 =
+                        Vector2.Lerp(
+                            a,
+                            b,
+                            bay /
+                            (float)bays
+                        );
+
+                    Vector2 p1 =
+                        Vector2.Lerp(
+                            a,
+                            b,
+                            (
+                                bay +
+                                1
+                            ) /
+                            (float)bays
+                        );
+
+                    CreateBeamBetween(
+                        levelRoot,
+                        new Vector3(
+                            p0.x,
+                            bottomY,
+                            p0.y
+                        ),
+                        new Vector3(
+                            p1.x,
+                            topY,
+                            p1.y
+                        ),
+                        ScaffoldBeamThickness *
+                        0.70f,
+                        m_ScaffoldMetalMaterial
+                    );
+
+                    CreateBeamBetween(
+                        levelRoot,
+                        new Vector3(
+                            p0.x,
+                            topY,
+                            p0.y
+                        ),
+                        new Vector3(
+                            p1.x,
+                            bottomY,
+                            p1.y
+                        ),
+                        ScaffoldBeamThickness *
+                        0.70f,
+                        m_ScaffoldMetalMaterial
+                    );
+                }
+
+                // Wooden platform at this floor's top.
+                CreateDeckAlongEdge(
+                    levelRoot,
+                    a,
+                    b,
+                    topY +
+                    0.05f
+                );
+            }
+        }
+
+        // ============================================================
+        // WOOD DECK
+        // ============================================================
+
+        private void CreateDeckAlongEdge(
+            GameObject parent,
+            Vector2 a,
+            Vector2 b,
+            float y
+        )
+        {
+            Vector2 direction2D =
+                b -
+                a;
+
+            float length =
+                direction2D.magnitude;
+
+            if (
+                length <
+                0.25f
+            )
+            {
+                return;
+            }
+
+            direction2D.Normalize();
+
+            Vector2 center =
+                (
+                    a +
+                    b
+                ) *
+                0.5f;
+
+            CreateOrientedBox(
+                parent,
+                new Vector3(
+                    center.x,
+                    y,
+                    center.y
+                ),
+                new Vector3(
+                    ScaffoldDeckDepth,
+                    ScaffoldDeckThickness,
+                    length
+                ),
+                new Vector3(
+                    direction2D.x,
+                    0f,
+                    direction2D.y
+                ),
+                m_ScaffoldDeckMaterial
+            );
+        }
+
+        // ============================================================
+        // PRIMITIVES
+        // ============================================================
+
+        private void CreateBeamBetween(
+            GameObject parent,
+            Vector3 start,
+            Vector3 end,
+            float thickness,
+            Material material
+        )
+        {
+            Vector3 direction =
+                end -
+                start;
+
+            float length =
+                direction.magnitude;
+
+            if (
+                length <
+                0.001f
+            )
+            {
+                return;
+            }
+
+            GameObject beam =
+                GameObject.CreatePrimitive(
+                    PrimitiveType.Cube
+                );
+
+            beam.name =
+                "ScaffoldBeam";
+
+            beam.hideFlags =
+                HideFlags.DontSave;
+
+            beam.transform.SetParent(
+                parent.transform,
+                false
+            );
+
+            beam.transform.localPosition =
+                (
+                    start +
+                    end
+                ) *
+                0.5f;
+
+            beam.transform.localRotation =
+                Quaternion.FromToRotation(
+                    Vector3.forward,
+                    direction.normalized
+                );
+
+            beam.transform.localScale =
+                new Vector3(
+                    thickness,
+                    thickness,
+                    length
+                );
+
+            MeshRenderer renderer =
+                beam.GetComponent<MeshRenderer>();
+
+            if (
+                renderer != null &&
+                material != null
+            )
+            {
+                renderer.sharedMaterial =
+                    material;
+            }
+
+            RemovePrimitiveCollider(
+                beam
+            );
+        }
+
+        private void CreateOrientedBox(
+            GameObject parent,
+            Vector3 center,
+            Vector3 size,
+            Vector3 forward,
+            Material material
+        )
+        {
+            GameObject box =
+                GameObject.CreatePrimitive(
+                    PrimitiveType.Cube
+                );
+
+            box.name =
+                "ScaffoldWoodDeck";
+
+            box.hideFlags =
+                HideFlags.DontSave;
+
+            box.transform.SetParent(
+                parent.transform,
+                false
+            );
+
+            box.transform.localPosition =
+                center;
+
+            if (
+                forward.sqrMagnitude >
+                0.001f
+            )
+            {
+                box.transform.localRotation =
+                    Quaternion.FromToRotation(
+                        Vector3.forward,
+                        forward.normalized
+                    );
+            }
+            else
+            {
+                box.transform.localRotation =
+                    Quaternion.identity;
+            }
+
+            box.transform.localScale =
+                size;
+
+            MeshRenderer renderer =
+                box.GetComponent<MeshRenderer>();
+
+            if (
+                renderer != null &&
+                material != null
+            )
+            {
+                renderer.sharedMaterial =
+                    material;
+            }
+
+            RemovePrimitiveCollider(
+                box
+            );
+        }
+
+        private static void RemovePrimitiveCollider(
+            GameObject gameObject
+        )
+        {
+            if (
+                gameObject == null
+            )
+            {
+                return;
+            }
+
+            try
+            {
+                Component component =
+                    gameObject.GetComponent(
+                        "BoxCollider"
+                    );
+
+                if (
+                    component != null
+                )
+                {
+                    UnityEngine.Object.Destroy(
+                        component
+                    );
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        // ============================================================
+        // MATERIALS
+        // ============================================================
+
+        private void CreateScaffoldMaterials()
+        {
+            DestroyScaffoldMaterials();
+
+            Shader shader =
+                Shader.Find(
+                    "HDRP/Lit"
+                );
+
+            if (
+                shader == null
+            )
+            {
+                shader =
+                    Shader.Find(
+                        "Standard"
+                    );
+            }
+
+            if (
+                shader == null
+            )
+            {
+                ModLog.Info(
+                    "V1.38 WARNING: no scaffold shader found."
+                );
+
+                return;
+            }
+
+            // --------------------------------------------------------
+            // METAL
+            // --------------------------------------------------------
+
+            m_ScaffoldMetalMaterial =
+                new Material(
+                    shader
+                );
+
+            m_ScaffoldMetalMaterial.name =
+                "ConstructionAnimation_ScaffoldMetal";
+
+            SetMaterialColor(
+                m_ScaffoldMetalMaterial,
+                new UnityEngine.Color(
+                    0.09f,
+                    0.085f,
+                    0.07f,
+                    1f
+                )
+            );
+
+            if (
+                m_ScaffoldMetalMaterial.HasProperty(
+                    "_Metallic"
+                )
+            )
+            {
+                m_ScaffoldMetalMaterial.SetFloat(
+                    "_Metallic",
+                    0.70f
+                );
+            }
+
+            if (
+                m_ScaffoldMetalMaterial.HasProperty(
+                    "_Smoothness"
+                )
+            )
+            {
+                m_ScaffoldMetalMaterial.SetFloat(
+                    "_Smoothness",
+                    0.25f
+                );
+            }
+
+            // --------------------------------------------------------
+            // WOOD
+            // --------------------------------------------------------
+
+            m_ScaffoldDeckMaterial =
+                new Material(
+                    shader
+                );
+
+            m_ScaffoldDeckMaterial.name =
+                "ConstructionAnimation_ScaffoldWood";
+
+            SetMaterialColor(
+                m_ScaffoldDeckMaterial,
+                new UnityEngine.Color(
+                    0.38f,
+                    0.25f,
+                    0.11f,
+                    1f
+                )
+            );
+
+            if (
+                m_ScaffoldDeckMaterial.HasProperty(
+                    "_Metallic"
+                )
+            )
+            {
+                m_ScaffoldDeckMaterial.SetFloat(
+                    "_Metallic",
+                    0f
+                );
+            }
+
+            if (
+                m_ScaffoldDeckMaterial.HasProperty(
+                    "_Smoothness"
+                )
+            )
+            {
+                m_ScaffoldDeckMaterial.SetFloat(
+                    "_Smoothness",
+                    0.08f
+                );
+            }
+        }
+
+        private static void SetMaterialColor(
+            Material material,
+            UnityEngine.Color color
+        )
+        {
+            if (
+                material == null
+            )
+            {
+                return;
+            }
+
+            if (
+                material.HasProperty(
+                    "_BaseColor"
+                )
+            )
+            {
+                material.SetColor(
+                    "_BaseColor",
+                    color
+                );
+            }
+
+            if (
+                material.HasProperty(
+                    "_Color"
+                )
+            )
+            {
+                material.SetColor(
+                    "_Color",
+                    color
+                );
+            }
+
+            try
+            {
+                material.color =
+                    color;
+            }
+            catch
+            {
+            }
+        }
+
+        private void DestroyScaffoldMaterials()
+        {
+            if (
+                m_ScaffoldMetalMaterial != null
+            )
+            {
+                try
+                {
+                    UnityEngine.Object.Destroy(
+                        m_ScaffoldMetalMaterial
+                    );
+                }
+                catch
+                {
+                }
+
+                m_ScaffoldMetalMaterial =
+                    null;
+            }
+
+            if (
+                m_ScaffoldDeckMaterial != null
+            )
+            {
+                try
+                {
+                    UnityEngine.Object.Destroy(
+                        m_ScaffoldDeckMaterial
+                    );
+                }
+                catch
+                {
+                }
+
+                m_ScaffoldDeckMaterial =
+                    null;
+            }
+        }
+
+        // ============================================================
+        // ECS VISUAL COPY
+        // ============================================================
+
+        private void CopyVisualComponent<T>(
+            Entity source,
+            Entity target
+        )
+            where T : unmanaged,
+            IComponentData
+        {
+            if (
+                !EntityManager.HasComponent<T>(
+                    source
+                )
+            )
+            {
+                return;
+            }
+
+            T value =
+                EntityManager.GetComponentData<T>(
+                    source
+                );
+
+            if (
+                EntityManager.HasComponent<T>(
+                    target
+                )
+            )
+            {
+                EntityManager.SetComponentData(
+                    target,
+                    value
+                );
+            }
+            else
+            {
+                EntityManager.AddComponentData(
+                    target,
+                    value
+                );
+            }
+        }
+
+        private void CopyMeshColorBuffer(
+            Entity source,
+            Entity targetEntity
+        )
+        {
+            if (
+                !EntityManager.HasBuffer<MeshColor>(
+                    targetEntity
+                )
+            )
+            {
+                EntityManager.AddBuffer<MeshColor>(
+                    targetEntity
+                );
+            }
+
+            DynamicBuffer<MeshColor> target =
+                EntityManager.GetBuffer<MeshColor>(
+                    targetEntity
+                );
+
+            target.Clear();
+
+            if (
+                !EntityManager.HasBuffer<MeshColor>(
+                    source
+                )
+            )
+            {
+                return;
+            }
+
+            DynamicBuffer<MeshColor> sourceBuffer =
+                EntityManager.GetBuffer<MeshColor>(
+                    source
+                );
+
+            for (
+                int i = 0;
+                i < sourceBuffer.Length;
+                i++
+            )
+            {
+                target.Add(
+                    sourceBuffer[i]
+                );
+            }
+        }
+
+        private void CopyCustomMeshColorBuffer(
+            Entity source,
+            Entity targetEntity
+        )
+        {
+            if (
+                !EntityManager.HasBuffer<CustomMeshColor>(
+                    targetEntity
+                )
+            )
+            {
+                EntityManager.AddBuffer<CustomMeshColor>(
+                    targetEntity
+                );
+            }
+
+            DynamicBuffer<CustomMeshColor> target =
+                EntityManager.GetBuffer<CustomMeshColor>(
+                    targetEntity
+                );
+
+            target.Clear();
+
+            if (
+                !EntityManager.HasBuffer<CustomMeshColor>(
+                    source
+                )
+            )
+            {
+                return;
+            }
+
+            DynamicBuffer<CustomMeshColor> sourceBuffer =
+                EntityManager.GetBuffer<CustomMeshColor>(
+                    source
+                );
+
+            for (
+                int i = 0;
+                i < sourceBuffer.Length;
+                i++
+            )
+            {
+                target.Add(
+                    sourceBuffer[i]
+                );
+            }
+        }
+
+        // ============================================================
+        // DESTROY CONSTRUCTION
+        // ============================================================
+
+        private void DestroyConstructionVisual(
+            ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null
+            )
+            {
+                return;
+            }
+
+            DestroyScaffold(
+                visual
+            );
+
+            ScheduleNativeProxyDestroy(
+                visual.Proxy
+            );
+
+            visual.Proxy =
+                Entity.Null;
+
+            visual.Source =
+                Entity.Null;
+        }
+
+        private void DestroyScaffold(
+            ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null
+            )
+            {
+                return;
+            }
+
+            if (
+                visual.ScaffoldRoot != null
+            )
+            {
+                try
+                {
+                    UnityEngine.Object.Destroy(
+                        visual.ScaffoldRoot
+                    );
+                }
+                catch
+                {
+                }
+            }
+
+            visual.ScaffoldRoot =
+                null;
+
+            visual.ScaffoldLevels.Clear();
+            visual.ScaffoldLevelBottoms.Clear();
+            visual.ScaffoldLevelHeights.Clear();
+
+            visual.ScaffoldHeight =
+                0f;
+        }
+
+        // ============================================================
+        // PROXY CLEANUP
+        // ============================================================
+
+        private void ScheduleNativeProxyDestroy(
+            Entity proxy
+        )
+        {
+            if (
+                proxy == Entity.Null ||
+                !EntityManager.Exists(
+                    proxy
+                )
+            )
+            {
+                return;
+            }
+
+            try
+            {
+                if (
+                    !EntityManager.HasComponent<Deleted>(
+                        proxy
+                    )
+                )
+                {
+                    EntityManager.AddComponent<Deleted>(
+                        proxy
+                    );
+                }
+
+                if (
+                    !EntityManager.HasComponent<Updated>(
+                        proxy
+                    )
+                )
+                {
+                    EntityManager.AddComponent<Updated>(
+                        proxy
+                    );
+                }
+
+                m_PendingProxyDestroys.Add(
+                    new PendingProxyDestroy
+                    {
+                        Entity = proxy,
+                        Frames = 0
+                    }
+                );
+            }
+            catch
+            {
+                try
+                {
+                    if (
+                        EntityManager.Exists(
+                            proxy
+                        )
+                    )
+                    {
+                        EntityManager.DestroyEntity(
+                            proxy
+                        );
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void ProcessPendingProxyDestroys()
+        {
+            for (
+                int i =
+                    m_PendingProxyDestroys.Count - 1;
+                i >= 0;
+                i--
+            )
+            {
+                PendingProxyDestroy pending =
+                    m_PendingProxyDestroys[i];
+
+                Entity proxy =
+                    pending.Entity;
+
+                if (
+                    proxy == Entity.Null ||
+                    !EntityManager.Exists(
+                        proxy
+                    )
+                )
+                {
+                    m_PendingProxyDestroys.RemoveAt(
+                        i
+                    );
+
+                    continue;
+                }
+
+                pending.Frames++;
+
+                try
+                {
+                    if (
+                        !EntityManager.HasComponent<Deleted>(
+                            proxy
+                        )
+                    )
+                    {
+                        EntityManager.AddComponent<Deleted>(
+                            proxy
+                        );
+                    }
+
+                    if (
+                        !EntityManager.HasComponent<Updated>(
+                            proxy
+                        )
+                    )
+                    {
+                        EntityManager.AddComponent<Updated>(
+                            proxy
+                        );
+                    }
+                }
+                catch
+                {
+                }
+
+                if (
+                    pending.Frames <
+                    ProxyDestroyDelayFrames
+                )
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (
+                        EntityManager.Exists(
+                            proxy
+                        )
+                    )
+                    {
+                        EntityManager.DestroyEntity(
+                            proxy
+                        );
+                    }
+                }
+                catch
+                {
+                }
+
+                m_PendingProxyDestroys.RemoveAt(
+                    i
+                );
+            }
+        }
+
+        // ============================================================
+        // LOGGING
+        // ============================================================
+
+        private void LogProgress(
+            ConstructionVisual visual,
+            UnderConstruction construction
+        )
+        {
+            if (
+                visual.LastProgress ==
+                construction.m_Progress
+            )
+            {
+                return;
+            }
+
+            byte progress =
+                construction.m_Progress;
+
+            if (
+                progress == 0 ||
+                progress == 10 ||
+                progress == 25 ||
+                progress == 50 ||
+                progress == 60 ||
+                progress == 75 ||
+                progress == 90 ||
+                progress >= 98
+            )
+            {
+                float buildingVisibleHeight =
+                    visual.BuildingHeight *
+                    visual.VisualProgress;
+
+                ModLog.Info(
+                    $"V1.38 source=" +
+                    $"{visual.Source.Index}:" +
+                    $"{visual.Source.Version} " +
+                    $"realProgress={progress}% " +
+                    $"visualProgress=" +
+                    $"{visual.VisualProgress * 100f:0.0}% " +
+                    $"visibleHeight=" +
+                    $"{buildingVisibleHeight:0.00}m " +
+                    $"floors={visual.ScaffoldLevels.Count}"
+                );
+            }
+
+            visual.LastProgress =
+                progress;
+        }
+
+        // ============================================================
+        // SYSTEM DESTROY
+        // ============================================================
+
+        protected override void OnDestroy()
+        {
+            foreach (
+                ConstructionVisual visual
+                in m_Visuals.Values
+            )
+            {
+                DestroyScaffold(
+                    visual
+                );
+
+                if (
+                    visual.Proxy != Entity.Null
+                )
+                {
+                    try
+                    {
+                        if (
+                            EntityManager.Exists(
+                                visual.Proxy
+                            )
+                        )
+                        {
+                            EntityManager.DestroyEntity(
+                                visual.Proxy
+                            );
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+
+            m_Visuals.Clear();
+
+            for (
+                int i = 0;
+                i < m_PendingProxyDestroys.Count;
+                i++
+            )
+            {
+                Entity proxy =
+                    m_PendingProxyDestroys[i]
+                        .Entity;
+
+                try
+                {
+                    if (
+                        proxy != Entity.Null &&
+                        EntityManager.Exists(
+                            proxy
+                        )
+                    )
+                    {
+                        EntityManager.DestroyEntity(
+                            proxy
+                        );
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            m_PendingProxyDestroys.Clear();
+
+            DestroyScaffoldMaterials();
+
+            base.OnDestroy();
+        }
+    }
+}

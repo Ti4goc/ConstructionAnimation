@@ -1,0 +1,72 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>ConstructionAnimation</AssemblyName>
+    <RootNamespace>ConstructionAnimation</RootNamespace>
+    <Version>0.1.0</Version>
+    <Title>Construction Animation</Title>
+    <Description>Experimental Cities: Skylines II construction animation mod.</Description>
+    <GameManagedPath>C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed</GameManagedPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Game">
+      <HintPath>$(GameManagedPath)\Game.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+	  <Reference Include="Colossal.IO.AssetDatabase">
+		  <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed\Colossal.IO.AssetDatabase.dll</HintPath>
+		  <Private>false</Private>
+	  </Reference>
+    <Reference Include="Colossal.Core">
+      <HintPath>$(GameManagedPath)\Colossal.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Colossal.Logging">
+      <HintPath>$(GameManagedPath)\Colossal.Logging.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+	  <Reference Include="Colossal.Mathematics">
+		  <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed\Colossal.Mathematics.dll</HintPath>
+		  <Private>false</Private>
+	  </Reference>
+    <Reference Include="Unity.Entities">
+      <HintPath>$(GameManagedPath)\Unity.Entities.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Collections">
+      <HintPath>$(GameManagedPath)\Unity.Collections.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Mathematics">
+      <HintPath>$(GameManagedPath)\Unity.Mathematics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+	  <Reference Include="UnityEngine.CoreModule">
+		  <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Cities Skylines II\Cities2_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+		  <Private>false</Private>
+	  </Reference>
+	  <Reference Include="UnityEngine.ImageConversionModule">
+		  <HintPath>$(GameManagedPath)\UnityEngine.ImageConversionModule.dll</HintPath>
+		  <Private>false</Private>
+	  </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\Textures\ScaffoldMetal_BaseColor.jpg" />
+    <EmbeddedResource Include="Resources\Textures\ScaffoldMetal_MaskMap.png" />
+    <EmbeddedResource Include="Resources\Textures\ScaffoldWood_BaseColor.jpg" />
+    <EmbeddedResource Include="Resources\Textures\ScaffoldWood_MaskMap.png" />
+  </ItemGroup>
+
+  <!-- If the official Cities: Skylines II mod toolchain is installed,
+       these imports add the game's normal build/deploy integration. -->
+  <Import Project="$([System.Environment]::GetEnvironmentVariable('CSII_TOOLPATH', 'EnvironmentVariableTarget.User'))\Mod.props"
+          Condition="'$(CSII_TOOLPATH)' != '' AND Exists('$(CSII_TOOLPATH)\Mod.props')" />
+  <Import Project="$([System.Environment]::GetEnvironmentVariable('CSII_TOOLPATH', 'EnvironmentVariableTarget.User'))\Mod.targets"
+          Condition="'$(CSII_TOOLPATH)' != '' AND Exists('$(CSII_TOOLPATH)\Mod.targets')" />
+</Project>

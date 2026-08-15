@@ -1,0 +1,2587 @@
+using Colossal.IO.AssetDatabase;
+using Game;
+using Game.Buildings;
+using Game.Common;
+using Game.Objects;
+using Game.Prefabs;
+using Game.Rendering;
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Reflection.Emit;
+using Unity.Collections;
+using Unity.Entities;
+using Unity.Mathematics;
+using UnityEngine;
+using UnityEngine.Rendering;
+
+namespace ConstructionAnimation.Systems
+{
+    public partial class ConstructionDetectionSystem : GameSystemBase
+    {
+        private EntityQuery m_BuildingQuery;
+
+        private Entity m_TrackedBuilding = Entity.Null;
+        private Entity m_VisualProxy = Entity.Null;
+
+        private float m_BuildingHeight = 20f;
+        private byte m_LastProgress = 255;
+
+        private PrefabSystem m_PrefabSystem;
+
+        private GameObject m_UnityRoot;
+        private bool m_UnityCopyAttempted;
+
+        // V1.29
+        private bool m_RendererScanDone;
+
+        private readonly List<GeometryAsset> m_LoadedGeometryAssets =
+            new List<GeometryAsset>();
+
+        private readonly List<SurfaceAsset> m_LoadedSurfaceAssets =
+            new List<SurfaceAsset>();
+
+        private static readonly string[] s_ShaderTargets =
+        {
+            "colossal_BuildingState",
+            "colossal_MetaParameters",
+            "colossal_ShapeParameters1",
+            "colossal_ShapeParameters2",
+            "colossal_BoneParameters",
+            "colossal_LodFade",
+            "colossal_InfoviewColor",
+            "colossal_ColorMask0",
+            "colossal_ColorMask1",
+            "colossal_ColorMask2",
+            "colossal_Wetness"
+        };
+
+        private static readonly string[] s_RenderKeywords =
+        {
+            "BuildingState",
+            "MetaParameters",
+            "ShapeParameters",
+            "BoneParameters",
+            "LodFade",
+            "PropertyBlock",
+            "MaterialPropertyBlock",
+            "BatchInstance",
+            "MeshBatch",
+            "RenderBatch",
+            "InstanceData",
+            "RenderData",
+            "UnderConstruction",
+            "Construction"
+        };
+
+        private static readonly Dictionary<short, OpCode> s_OpCodes =
+            BuildOpCodeMap();
+
+        protected override void OnCreate()
+        {
+            base.OnCreate();
+
+            m_PrefabSystem =
+                World.GetOrCreateSystemManaged<PrefabSystem>();
+
+            m_BuildingQuery =
+                GetEntityQuery(
+                    ComponentType.ReadOnly<UnderConstruction>(),
+                    ComponentType.ReadOnly<Building>(),
+                    ComponentType.ReadOnly<PrefabRef>(),
+                    ComponentType.ReadOnly<Game.Objects.Transform>()
+                );
+
+            ModLog.Info(
+                "ConstructionAnimation V1.29 renderer reverse-engineering diagnostic created."
+            );
+        }
+
+        protected override void OnUpdate()
+        {
+            if (
+                m_TrackedBuilding == Entity.Null ||
+                !EntityManager.Exists(m_TrackedBuilding) ||
+                !EntityManager.HasComponent<UnderConstruction>(
+                    m_TrackedBuilding
+                )
+            )
+            {
+                DestroyEverything();
+
+                FindBuilding();
+
+                if (m_TrackedBuilding == Entity.Null)
+                    return;
+
+                CreateNativeProxy(
+                    m_TrackedBuilding
+                );
+
+                DumpSourceVisualState(
+                    m_TrackedBuilding
+                );
+
+                RunRendererReflectionScan();
+
+                CreateUnityCopy();
+            }
+
+            if (
+                m_VisualProxy == Entity.Null ||
+                !EntityManager.Exists(m_VisualProxy)
+            )
+            {
+                return;
+            }
+
+            UpdateProxyAnimation();
+        }
+
+        // ============================================================
+        // BUILDING DETECTION
+        // ============================================================
+
+        private void FindBuilding()
+        {
+            m_TrackedBuilding = Entity.Null;
+            m_LastProgress = 255;
+            m_UnityCopyAttempted = false;
+
+            if (m_BuildingQuery.IsEmptyIgnoreFilter)
+                return;
+
+            using NativeArray<Entity> buildings =
+                m_BuildingQuery.ToEntityArray(
+                    Allocator.Temp
+                );
+
+            if (buildings.Length == 0)
+                return;
+
+            m_TrackedBuilding =
+                buildings[0];
+
+            PrefabRef prefabRef =
+                EntityManager.GetComponentData<PrefabRef>(
+                    m_TrackedBuilding
+                );
+
+            ModLog.Info(
+                $"V1.29 tracking building " +
+                $"{m_TrackedBuilding.Index}:" +
+                $"{m_TrackedBuilding.Version}"
+            );
+
+            ModLog.Info(
+                $"V1.29 source prefab = " +
+                $"{prefabRef.m_Prefab.Index}:" +
+                $"{prefabRef.m_Prefab.Version}"
+            );
+        }
+
+        // ============================================================
+        // NATIVE ECS PROXY
+        // ============================================================
+
+        private void CreateNativeProxy(
+            Entity source
+        )
+        {
+            try
+            {
+                DestroyNativeProxy();
+
+                PrefabRef prefabRef =
+                    EntityManager.GetComponentData<PrefabRef>(
+                        source
+                    );
+
+                Game.Objects.Transform transform =
+                    EntityManager.GetComponentData<
+                        Game.Objects.Transform
+                    >(
+                        source
+                    );
+
+                ReadBuildingHeight(
+                    prefabRef.m_Prefab
+                );
+
+                EntityArchetype archetype =
+                    EntityManager.CreateArchetype(
+                        typeof(PrefabRef),
+                        typeof(Game.Objects.Transform),
+                        typeof(Game.Objects.Object),
+                        typeof(Game.Objects.ObjectGeometry),
+                        typeof(Game.Objects.Static),
+                        typeof(Created),
+                        typeof(Updated),
+                        typeof(Unity.Entities.Simulate)
+                    );
+
+                m_VisualProxy =
+                    EntityManager.CreateEntity(
+                        archetype
+                    );
+
+                EntityManager.SetComponentData(
+                    m_VisualProxy,
+                    prefabRef
+                );
+
+                EntityManager.SetComponentData(
+                    m_VisualProxy,
+                    transform
+                );
+
+                CopyVisualComponent<CullingInfo>(
+                    source
+                );
+
+                CopyVisualComponent<Game.Objects.Color>(
+                    source
+                );
+
+                CopyVisualComponent<Game.Objects.Surface>(
+                    source
+                );
+
+                CopyVisualComponent<PseudoRandomSeed>(
+                    source
+                );
+
+                CopyMeshColorBuffer(
+                    source
+                );
+
+                CopyCustomMeshColorBuffer(
+                    source
+                );
+
+                if (
+                    !EntityManager.HasBuffer<MeshBatch>(
+                        m_VisualProxy
+                    )
+                )
+                {
+                    EntityManager.AddBuffer<MeshBatch>(
+                        m_VisualProxy
+                    );
+                }
+
+                ModLog.Info(
+                    $"V1.29 native proxy = " +
+                    $"{m_VisualProxy.Index}:" +
+                    $"{m_VisualProxy.Version}"
+                );
+
+                ModLog.Info(
+                    $"V1.29 building height = " +
+                    $"{m_BuildingHeight:0.00} m"
+                );
+
+                UpdateProxyAnimation();
+            }
+            catch (Exception ex)
+            {
+                ModLog.Error(
+                    $"V1.29 CreateNativeProxy failed: {ex}"
+                );
+
+                DestroyNativeProxy();
+            }
+        }
+
+        private void ReadBuildingHeight(
+            Entity prefab
+        )
+        {
+            m_BuildingHeight = 20f;
+
+            try
+            {
+                if (
+                    !EntityManager.HasComponent<ObjectGeometryData>(
+                        prefab
+                    )
+                )
+                {
+                    return;
+                }
+
+                ObjectGeometryData geometry =
+                    EntityManager.GetComponentData<
+                        ObjectGeometryData
+                    >(
+                        prefab
+                    );
+
+                float height =
+                    geometry.m_Size.y;
+
+                if (
+                    height > 0.5f &&
+                    height < 1000f
+                )
+                {
+                    m_BuildingHeight =
+                        height;
+                }
+
+                ModLog.Info(
+                    $"V1.29 geometry size = " +
+                    $"{geometry.m_Size}"
+                );
+
+                ModLog.Info(
+                    $"V1.29 geometry pivot = " +
+                    $"{geometry.m_Pivot}"
+                );
+            }
+            catch (Exception ex)
+            {
+                ModLog.Info(
+                    $"V1.29 ReadBuildingHeight failed: " +
+                    $"{ex.GetType().Name}"
+                );
+            }
+        }
+
+        // ============================================================
+        // PROXY ANIMATION
+        // ============================================================
+
+        private void UpdateProxyAnimation()
+        {
+            if (
+                m_TrackedBuilding == Entity.Null ||
+                m_VisualProxy == Entity.Null
+            )
+            {
+                return;
+            }
+
+            if (
+                !EntityManager.Exists(m_TrackedBuilding) ||
+                !EntityManager.Exists(m_VisualProxy)
+            )
+            {
+                return;
+            }
+
+            if (
+                !EntityManager.HasComponent<UnderConstruction>(
+                    m_TrackedBuilding
+                )
+            )
+            {
+                return;
+            }
+
+            Game.Objects.Transform sourceTransform =
+                EntityManager.GetComponentData<
+                    Game.Objects.Transform
+                >(
+                    m_TrackedBuilding
+                );
+
+            UnderConstruction construction =
+                EntityManager.GetComponentData<
+                    UnderConstruction
+                >(
+                    m_TrackedBuilding
+                );
+
+            float progress =
+                math.saturate(
+                    construction.m_Progress /
+                    100f
+                );
+
+            float hiddenDistance =
+                m_BuildingHeight +
+                0.5f;
+
+            float verticalOffset =
+                -hiddenDistance *
+                (1f - progress);
+
+            Game.Objects.Transform proxyTransform =
+                sourceTransform;
+
+            proxyTransform.m_Position.y +=
+                verticalOffset;
+
+            EntityManager.SetComponentData(
+                m_VisualProxy,
+                proxyTransform
+            );
+
+            MarkProxyUpdated();
+
+            if (
+                construction.m_Progress !=
+                m_LastProgress
+            )
+            {
+                byte current =
+                    construction.m_Progress;
+
+                if (
+                    current == 0 ||
+                    current == 10 ||
+                    current == 25 ||
+                    current == 50 ||
+                    current == 75 ||
+                    current == 90 ||
+                    current >= 98
+                )
+                {
+                    int meshBatchCount =
+                        EntityManager.HasBuffer<MeshBatch>(
+                            m_VisualProxy
+                        )
+                        ?
+                        EntityManager
+                            .GetBuffer<MeshBatch>(
+                                m_VisualProxy
+                            )
+                            .Length
+                        :
+                        -1;
+
+                    ModLog.Info(
+                        $"V1.29 progress={current}% " +
+                        $"offsetY={verticalOffset:0.00} m " +
+                        $"MeshBatch={meshBatchCount}"
+                    );
+                }
+
+                m_LastProgress =
+                    current;
+            }
+        }
+
+        private void MarkProxyUpdated()
+        {
+            if (
+                m_VisualProxy == Entity.Null ||
+                !EntityManager.Exists(
+                    m_VisualProxy
+                )
+            )
+            {
+                return;
+            }
+
+            if (
+                !EntityManager.HasComponent<Updated>(
+                    m_VisualProxy
+                )
+            )
+            {
+                EntityManager.AddComponent<Updated>(
+                    m_VisualProxy
+                );
+            }
+        }
+
+        // ============================================================
+        // V1.28 ECS VISUAL STATE DIAGNOSTIC
+        // ============================================================
+
+        private void DumpSourceVisualState(
+            Entity source
+        )
+        {
+            ModLog.Info(
+                "========== V1.29 SOURCE VISUAL STATE BEGIN =========="
+            );
+
+            DumpComponent<Game.Objects.Color>(
+                source,
+                "Game.Objects.Color"
+            );
+
+            DumpComponent<Game.Objects.Surface>(
+                source,
+                "Game.Objects.Surface"
+            );
+
+            DumpComponent<PseudoRandomSeed>(
+                source,
+                "PseudoRandomSeed"
+            );
+
+            DumpComponent<CullingInfo>(
+                source,
+                "CullingInfo"
+            );
+
+            DumpBuffer<MeshColor>(
+                source,
+                "MeshColor"
+            );
+
+            DumpBuffer<CustomMeshColor>(
+                source,
+                "CustomMeshColor"
+            );
+
+            ModLog.Info(
+                "========== V1.29 SOURCE VISUAL STATE END =========="
+            );
+        }
+
+        private void DumpComponent<T>(
+            Entity entity,
+            string label
+        )
+            where T : unmanaged,
+            IComponentData
+        {
+            try
+            {
+                if (
+                    !EntityManager.HasComponent<T>(
+                        entity
+                    )
+                )
+                {
+                    ModLog.Info(
+                        $"V1.29 ECS {label}: NOT PRESENT"
+                    );
+
+                    return;
+                }
+
+                T value =
+                    EntityManager.GetComponentData<T>(
+                        entity
+                    );
+
+                object boxed =
+                    value;
+
+                ModLog.Info(
+                    $"V1.29 ECS {label}: PRESENT"
+                );
+
+                DumpObjectFields(
+                    boxed,
+                    $"V1.29 ECS {label}",
+                    0
+                );
+            }
+            catch (Exception ex)
+            {
+                ModLog.Info(
+                    $"V1.29 ECS {label} dump failed: " +
+                    $"{ex.GetType().Name}: " +
+                    $"{ex.Message}"
+                );
+            }
+        }
+
+        private void DumpBuffer<T>(
+            Entity entity,
+            string label
+        )
+            where T : unmanaged,
+            IBufferElementData
+        {
+            try
+            {
+                if (
+                    !EntityManager.HasBuffer<T>(
+                        entity
+                    )
+                )
+                {
+                    ModLog.Info(
+                        $"V1.29 ECS BUFFER {label}: NOT PRESENT"
+                    );
+
+                    return;
+                }
+
+                DynamicBuffer<T> buffer =
+                    EntityManager.GetBuffer<T>(
+                        entity
+                    );
+
+                ModLog.Info(
+                    $"V1.29 ECS BUFFER {label}: " +
+                    $"PRESENT count={buffer.Length}"
+                );
+
+                for (
+                    int i = 0;
+                    i < buffer.Length;
+                    i++
+                )
+                {
+                    object boxed =
+                        buffer[i];
+
+                    DumpObjectFields(
+                        boxed,
+                        $"V1.29 ECS BUFFER {label}[{i}]",
+                        0
+                    );
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLog.Info(
+                    $"V1.29 ECS BUFFER {label} dump failed: " +
+                    $"{ex.GetType().Name}: " +
+                    $"{ex.Message}"
+                );
+            }
+        }
+
+        private void DumpObjectFields(
+            object value,
+            string prefix,
+            int depth
+        )
+        {
+            if (value == null)
+            {
+                ModLog.Info(
+                    $"{prefix} = <null>"
+                );
+
+                return;
+            }
+
+            if (depth > 2)
+            {
+                ModLog.Info(
+                    $"{prefix} = {value}"
+                );
+
+                return;
+            }
+
+            Type type =
+                value.GetType();
+
+            FieldInfo[] fields =
+                type.GetFields(
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic
+                );
+
+            if (fields.Length == 0)
+            {
+                ModLog.Info(
+                    $"{prefix} = {FormatValue(value)}"
+                );
+
+                return;
+            }
+
+            foreach (
+                FieldInfo field
+                in fields
+            )
+            {
+                try
+                {
+                    object fieldValue =
+                        field.GetValue(
+                            value
+                        );
+
+                    string fieldPrefix =
+                        $"{prefix}.{field.Name}";
+
+                    if (
+                        fieldValue == null
+                    )
+                    {
+                        ModLog.Info(
+                            $"{fieldPrefix} = <null>"
+                        );
+
+                        continue;
+                    }
+
+                    Type fieldType =
+                        field.FieldType;
+
+                    if (
+                        IsSimpleDiagnosticType(
+                            fieldType
+                        )
+                    )
+                    {
+                        ModLog.Info(
+                            $"{fieldPrefix} = " +
+                            $"{FormatValue(fieldValue)}"
+                        );
+                    }
+                    else
+                    {
+                        DumpObjectFields(
+                            fieldValue,
+                            fieldPrefix,
+                            depth + 1
+                        );
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ModLog.Info(
+                        $"{prefix}.{field.Name} = " +
+                        $"<error {ex.GetType().Name}>"
+                    );
+                }
+            }
+        }
+
+        private static bool IsSimpleDiagnosticType(
+            Type type
+        )
+        {
+            if (
+                type.IsPrimitive ||
+                type.IsEnum ||
+                type == typeof(string) ||
+                type == typeof(decimal)
+            )
+            {
+                return true;
+            }
+
+            if (
+                type == typeof(float2) ||
+                type == typeof(float3) ||
+                type == typeof(float4) ||
+                type == typeof(quaternion) ||
+                type == typeof(Vector2) ||
+                type == typeof(Vector3) ||
+                type == typeof(Vector4) ||
+                type == typeof(UnityEngine.Color)
+            )
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static string FormatValue(
+            object value
+        )
+        {
+            if (value == null)
+                return "<null>";
+
+            return value.ToString();
+        }
+
+        // ============================================================
+        // V1.29
+        // GAME.DLL RENDERER REVERSE ENGINEERING
+        // ============================================================
+
+        private void RunRendererReflectionScan()
+        {
+            if (m_RendererScanDone)
+                return;
+
+            m_RendererScanDone = true;
+
+            try
+            {
+                Assembly gameAssembly =
+                    typeof(Building).Assembly;
+
+                ModLog.Info(
+                    "========== V1.29 RENDERER SCAN BEGIN =========="
+                );
+
+                ModLog.Info(
+                    $"V1.29 GAME ASSEMBLY = " +
+                    $"{gameAssembly.FullName}"
+                );
+
+                Type[] types =
+                    GetAssemblyTypesSafe(
+                        gameAssembly
+                    );
+
+                ModLog.Info(
+                    $"V1.29 assembly type count = " +
+                    $"{types.Length}"
+                );
+
+                int typeMatches = 0;
+                int fieldMatches = 0;
+                int methodMatches = 0;
+                int stringMatches = 0;
+
+                const int maxLoggedMatches = 400;
+
+                foreach (
+                    Type type
+                    in types
+                )
+                {
+                    if (type == null)
+                        continue;
+
+                    string fullName =
+                        type.FullName ??
+                        type.Name ??
+                        "<unknown>";
+
+                    bool renderingNamespace =
+                        fullName.StartsWith(
+                            "Game.Rendering",
+                            StringComparison.Ordinal
+                        );
+
+                    bool interestingTypeName =
+                        ContainsAnyKeyword(
+                            fullName,
+                            s_RenderKeywords
+                        );
+
+                    if (
+                        renderingNamespace ||
+                        interestingTypeName
+                    )
+                    {
+                        if (
+                            typeMatches <
+                            maxLoggedMatches
+                        )
+                        {
+                            ModLog.Info(
+                                $"V1.29 TYPE MATCH: " +
+                                $"{fullName}"
+                            );
+                        }
+
+                        typeMatches++;
+                    }
+
+                    ScanTypeFields(
+                        type,
+                        ref fieldMatches,
+                        maxLoggedMatches
+                    );
+
+                    ScanTypeMethods(
+                        type,
+                        ref methodMatches,
+                        ref stringMatches,
+                        maxLoggedMatches
+                    );
+                }
+
+                ModLog.Info(
+                    "========== V1.29 RENDERER SCAN SUMMARY =========="
+                );
+
+                ModLog.Info(
+                    $"V1.29 typeMatches={typeMatches}"
+                );
+
+                ModLog.Info(
+                    $"V1.29 fieldMatches={fieldMatches}"
+                );
+
+                ModLog.Info(
+                    $"V1.29 methodMatches={methodMatches}"
+                );
+
+                ModLog.Info(
+                    $"V1.29 shaderStringMatches={stringMatches}"
+                );
+
+                ModLog.Info(
+                    "========== V1.29 RENDERER SCAN END =========="
+                );
+            }
+            catch (Exception ex)
+            {
+                ModLog.Error(
+                    $"V1.29 renderer scan failed: {ex}"
+                );
+            }
+        }
+
+        private static Type[] GetAssemblyTypesSafe(
+            Assembly assembly
+        )
+        {
+            try
+            {
+                return assembly.GetTypes();
+            }
+            catch (
+                ReflectionTypeLoadException ex
+            )
+            {
+                List<Type> result =
+                    new List<Type>();
+
+                if (ex.Types != null)
+                {
+                    foreach (
+                        Type type
+                        in ex.Types
+                    )
+                    {
+                        if (type != null)
+                            result.Add(type);
+                    }
+                }
+
+                return result.ToArray();
+            }
+            catch
+            {
+                return Array.Empty<Type>();
+            }
+        }
+
+        private void ScanTypeFields(
+            Type type,
+            ref int matchCount,
+            int maxLoggedMatches
+        )
+        {
+            FieldInfo[] fields;
+
+            try
+            {
+                fields =
+                    type.GetFields(
+                        BindingFlags.Instance |
+                        BindingFlags.Static |
+                        BindingFlags.Public |
+                        BindingFlags.NonPublic |
+                        BindingFlags.DeclaredOnly
+                    );
+            }
+            catch
+            {
+                return;
+            }
+
+            foreach (
+                FieldInfo field
+                in fields
+            )
+            {
+                string fieldName =
+                    field.Name ??
+                    "";
+
+                string fieldTypeName =
+                    field.FieldType?.FullName ??
+                    field.FieldType?.Name ??
+                    "";
+
+                bool match =
+                    ContainsAnyKeyword(
+                        fieldName,
+                        s_RenderKeywords
+                    ) ||
+                    ContainsAnyKeyword(
+                        fieldTypeName,
+                        s_RenderKeywords
+                    );
+
+                if (!match)
+                    continue;
+
+                if (
+                    matchCount <
+                    maxLoggedMatches
+                )
+                {
+                    ModLog.Info(
+                        $"V1.29 FIELD MATCH: " +
+                        $"{type.FullName}.{fieldName} " +
+                        $"type={fieldTypeName}"
+                    );
+                }
+
+                matchCount++;
+            }
+        }
+
+        private void ScanTypeMethods(
+            Type type,
+            ref int methodMatchCount,
+            ref int stringMatchCount,
+            int maxLoggedMatches
+        )
+        {
+            MethodInfo[] methods;
+
+            try
+            {
+                methods =
+                    type.GetMethods(
+                        BindingFlags.Instance |
+                        BindingFlags.Static |
+                        BindingFlags.Public |
+                        BindingFlags.NonPublic |
+                        BindingFlags.DeclaredOnly
+                    );
+            }
+            catch
+            {
+                return;
+            }
+
+            foreach (
+                MethodInfo method
+                in methods
+            )
+            {
+                string methodName =
+                    method.Name ??
+                    "";
+
+                bool nameMatch =
+                    ContainsAnyKeyword(
+                        methodName,
+                        s_RenderKeywords
+                    );
+
+                if (nameMatch)
+                {
+                    if (
+                        methodMatchCount <
+                        maxLoggedMatches
+                    )
+                    {
+                        ModLog.Info(
+                            $"V1.29 METHOD MATCH: " +
+                            $"{type.FullName}.{method.Name}"
+                        );
+                    }
+
+                    methodMatchCount++;
+                }
+
+                List<string> shaderStrings =
+                    FindTargetStringsInMethod(
+                        method
+                    );
+
+                if (
+                    shaderStrings.Count ==
+                    0
+                )
+                {
+                    continue;
+                }
+
+                foreach (
+                    string shaderString
+                    in shaderStrings
+                )
+                {
+                    if (
+                        stringMatchCount <
+                        maxLoggedMatches
+                    )
+                    {
+                        ModLog.Info(
+                            $"V1.29 IL STRING MATCH: " +
+                            $"{type.FullName}.{method.Name} " +
+                            $"-> \"{shaderString}\""
+                        );
+                    }
+
+                    stringMatchCount++;
+                }
+            }
+        }
+
+        private static List<string>
+            FindTargetStringsInMethod(
+                MethodInfo method
+            )
+        {
+            List<string> result =
+                new List<string>();
+
+            MethodBody body;
+
+            try
+            {
+                body =
+                    method.GetMethodBody();
+            }
+            catch
+            {
+                return result;
+            }
+
+            if (body == null)
+                return result;
+
+            byte[] il;
+
+            try
+            {
+                il =
+                    body.GetILAsByteArray();
+            }
+            catch
+            {
+                return result;
+            }
+
+            if (
+                il == null ||
+                il.Length == 0
+            )
+            {
+                return result;
+            }
+
+            int position = 0;
+
+            while (
+                position <
+                il.Length
+            )
+            {
+                try
+                {
+                    OpCode opcode =
+                        ReadOpCode(
+                            il,
+                            ref position
+                        );
+
+                    if (
+                        opcode.Size == 0
+                    )
+                    {
+                        break;
+                    }
+
+                    OperandType operandType =
+                        opcode.OperandType;
+
+                    if (
+                        operandType ==
+                        OperandType.InlineString
+                    )
+                    {
+                        if (
+                            position + 4 >
+                            il.Length
+                        )
+                        {
+                            break;
+                        }
+
+                        int token =
+                            BitConverter.ToInt32(
+                                il,
+                                position
+                            );
+
+                        position += 4;
+
+                        string literal = null;
+
+                        try
+                        {
+                            literal =
+                                method.Module.ResolveString(
+                                    token
+                                );
+                        }
+                        catch
+                        {
+                        }
+
+                        if (
+                            literal != null &&
+                            IsTargetShaderString(
+                                literal
+                            )
+                        )
+                        {
+                            if (
+                                !result.Contains(
+                                    literal
+                                )
+                            )
+                            {
+                                result.Add(
+                                    literal
+                                );
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    int operandSize =
+                        GetOperandSize(
+                            operandType,
+                            il,
+                            position
+                        );
+
+                    if (operandSize < 0)
+                        break;
+
+                    position +=
+                        operandSize;
+                }
+                catch
+                {
+                    break;
+                }
+            }
+
+            return result;
+        }
+
+        private static OpCode ReadOpCode(
+            byte[] il,
+            ref int position
+        )
+        {
+            if (
+                position >=
+                il.Length
+            )
+            {
+                return default(OpCode);
+            }
+
+            byte first =
+                il[position++];
+
+            short value;
+
+            if (
+                first ==
+                0xFE
+            )
+            {
+                if (
+                    position >=
+                    il.Length
+                )
+                {
+                    return default(OpCode);
+                }
+
+                byte second =
+                    il[position++];
+
+                value =
+                    unchecked(
+                        (short)(
+                            0xFE00 |
+                            second
+                        )
+                    );
+            }
+            else
+            {
+                value =
+                    first;
+            }
+
+            if (
+                s_OpCodes.TryGetValue(
+                    value,
+                    out OpCode opcode
+                )
+            )
+            {
+                return opcode;
+            }
+
+            return default(OpCode);
+        }
+
+        private static int GetOperandSize(
+            OperandType operandType,
+            byte[] il,
+            int position
+        )
+        {
+            switch (operandType)
+            {
+                case OperandType.InlineNone:
+                    return 0;
+
+                case OperandType.ShortInlineBrTarget:
+                case OperandType.ShortInlineI:
+                case OperandType.ShortInlineVar:
+                    return 1;
+
+                case OperandType.InlineVar:
+                    return 2;
+
+                case OperandType.InlineBrTarget:
+                case OperandType.InlineField:
+                case OperandType.InlineI:
+                case OperandType.InlineMethod:
+                case OperandType.InlineSig:
+                case OperandType.InlineString:
+                case OperandType.InlineTok:
+                case OperandType.InlineType:
+                case OperandType.ShortInlineR:
+                    return 4;
+
+                case OperandType.InlineI8:
+                case OperandType.InlineR:
+                    return 8;
+
+                case OperandType.InlineSwitch:
+                    {
+                        if (
+                            position + 4 >
+                            il.Length
+                        )
+                        {
+                            return -1;
+                        }
+
+                        int count =
+                            BitConverter.ToInt32(
+                                il,
+                                position
+                            );
+
+                        if (count < 0)
+                            return -1;
+
+                        return 4 +
+                            (count * 4);
+                    }
+
+                default:
+                    return -1;
+            }
+        }
+
+        private static Dictionary<short, OpCode>
+            BuildOpCodeMap()
+        {
+            Dictionary<short, OpCode> map =
+                new Dictionary<short, OpCode>();
+
+            FieldInfo[] fields =
+                typeof(OpCodes).GetFields(
+                    BindingFlags.Public |
+                    BindingFlags.Static
+                );
+
+            foreach (
+                FieldInfo field
+                in fields
+            )
+            {
+                if (
+                    field.FieldType !=
+                    typeof(OpCode)
+                )
+                {
+                    continue;
+                }
+
+                try
+                {
+                    OpCode opcode =
+                        (OpCode)field.GetValue(
+                            null
+                        );
+
+                    map[opcode.Value] =
+                        opcode;
+                }
+                catch
+                {
+                }
+            }
+
+            return map;
+        }
+
+        private static bool ContainsAnyKeyword(
+            string text,
+            string[] keywords
+        )
+        {
+            if (
+                string.IsNullOrEmpty(
+                    text
+                )
+            )
+            {
+                return false;
+            }
+
+            foreach (
+                string keyword
+                in keywords
+            )
+            {
+                if (
+                    text.IndexOf(
+                        keyword,
+                        StringComparison.OrdinalIgnoreCase
+                    ) >= 0
+                )
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsTargetShaderString(
+            string value
+        )
+        {
+            if (
+                string.IsNullOrEmpty(
+                    value
+                )
+            )
+            {
+                return false;
+            }
+
+            foreach (
+                string target
+                in s_ShaderTargets
+            )
+            {
+                if (
+                    value.IndexOf(
+                        target,
+                        StringComparison.OrdinalIgnoreCase
+                    ) >= 0
+                )
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // ============================================================
+        // UNITY COPY
+        // ============================================================
+
+        private void CreateUnityCopy()
+        {
+            if (m_UnityCopyAttempted)
+                return;
+
+            m_UnityCopyAttempted =
+                true;
+
+            try
+            {
+                PrefabRef prefabRef =
+                    EntityManager.GetComponentData<PrefabRef>(
+                        m_TrackedBuilding
+                    );
+
+                Entity buildingPrefab =
+                    prefabRef.m_Prefab;
+
+                if (
+                    !EntityManager.HasBuffer<SubMesh>(
+                        buildingPrefab
+                    )
+                )
+                {
+                    return;
+                }
+
+                DynamicBuffer<SubMesh> subMeshes =
+                    EntityManager.GetBuffer<SubMesh>(
+                        buildingPrefab
+                    );
+
+                ModLog.Info(
+                    $"V1.29 Unity copy: " +
+                    $"SubMesh count={subMeshes.Length}"
+                );
+
+                Game.Objects.Transform sourceTransform =
+                    EntityManager.GetComponentData<
+                        Game.Objects.Transform
+                    >(
+                        m_TrackedBuilding
+                    );
+
+                m_UnityRoot =
+                    new GameObject(
+                        "ConstructionAnimation_V1_29_UnityCopy"
+                    );
+
+                float3 sideOffset =
+                    math.rotate(
+                        sourceTransform.m_Rotation,
+                        new float3(
+                            35f,
+                            0f,
+                            0f
+                        )
+                    );
+
+                float3 rootPosition =
+                    sourceTransform.m_Position +
+                    sideOffset;
+
+                m_UnityRoot.transform.position =
+                    new Vector3(
+                        rootPosition.x,
+                        rootPosition.y,
+                        rootPosition.z
+                    );
+
+                quaternion sourceRotation =
+                    sourceTransform.m_Rotation;
+
+                m_UnityRoot.transform.rotation =
+                    new Quaternion(
+                        sourceRotation.value.x,
+                        sourceRotation.value.y,
+                        sourceRotation.value.z,
+                        sourceRotation.value.w
+                    );
+
+                int rendererCount = 0;
+
+                for (
+                    int i = 0;
+                    i < subMeshes.Length;
+                    i++
+                )
+                {
+                    rendererCount +=
+                        CreateUnitySubMesh(
+                            subMeshes[i],
+                            i
+                        );
+                }
+
+                ModLog.Info(
+                    $"V1.29 UNITY COPY CREATED: " +
+                    $"renderers={rendererCount}"
+                );
+            }
+            catch (Exception ex)
+            {
+                ModLog.Error(
+                    $"V1.29 CreateUnityCopy failed: {ex}"
+                );
+            }
+        }
+
+        private int CreateUnitySubMesh(
+            SubMesh subMesh,
+            int prefabSubMeshIndex
+        )
+        {
+            try
+            {
+                Entity renderPrefabEntity =
+                    subMesh.m_SubMesh;
+
+                if (
+                    renderPrefabEntity ==
+                        Entity.Null ||
+                    !EntityManager.Exists(
+                        renderPrefabEntity
+                    )
+                )
+                {
+                    return 0;
+                }
+
+                PrefabBase managedPrefab =
+                    m_PrefabSystem.GetPrefab<
+                        PrefabBase
+                    >(
+                        renderPrefabEntity
+                    );
+
+                if (managedPrefab == null)
+                    return 0;
+
+                GeometryAsset geometryAsset =
+                    GetGeometryAsset(
+                        managedPrefab
+                    );
+
+                if (geometryAsset == null)
+                    return 0;
+
+                Mesh[] meshes =
+                    geometryAsset.ObtainMeshes(
+                        true
+                    );
+
+                if (
+                    meshes == null ||
+                    meshes.Length == 0
+                )
+                {
+                    return 0;
+                }
+
+                if (
+                    !m_LoadedGeometryAssets.Contains(
+                        geometryAsset
+                    )
+                )
+                {
+                    m_LoadedGeometryAssets.Add(
+                        geometryAsset
+                    );
+                }
+
+                Material[] materials =
+                    LoadBestMaterials(
+                        managedPrefab
+                    );
+
+                ModLog.Info(
+                    $"V1.29 render prefab: " +
+                    $"meshes={meshes.Length}, " +
+                    $"materials={materials.Length}"
+                );
+
+                int created = 0;
+
+                for (
+                    int meshIndex = 0;
+                    meshIndex < meshes.Length;
+                    meshIndex++
+                )
+                {
+                    Mesh mesh =
+                        meshes[meshIndex];
+
+                    if (mesh == null)
+                        continue;
+
+                    GameObject child =
+                        new GameObject(
+                            $"V1_29_Mesh_" +
+                            $"{prefabSubMeshIndex}_" +
+                            $"{meshIndex}"
+                        );
+
+                    child.transform.SetParent(
+                        m_UnityRoot.transform,
+                        false
+                    );
+
+                    child.transform.localPosition =
+                        new Vector3(
+                            subMesh.m_Position.x,
+                            subMesh.m_Position.y,
+                            subMesh.m_Position.z
+                        );
+
+                    quaternion q =
+                        subMesh.m_Rotation;
+
+                    child.transform.localRotation =
+                        new Quaternion(
+                            q.value.x,
+                            q.value.y,
+                            q.value.z,
+                            q.value.w
+                        );
+
+                    MeshFilter filter =
+                        child.AddComponent<MeshFilter>();
+
+                    MeshRenderer renderer =
+                        child.AddComponent<MeshRenderer>();
+
+                    filter.sharedMesh =
+                        mesh;
+
+                    Material[] mappedMaterials =
+                        BuildMaterialArray(
+                            mesh,
+                            materials,
+                            meshIndex
+                        );
+
+                    renderer.sharedMaterials =
+                        mappedMaterials;
+
+                    ApplyDiagnosticPropertyBlock(
+                        renderer,
+                        mappedMaterials,
+                        meshIndex
+                    );
+
+                    created++;
+                }
+
+                return created;
+            }
+            catch (Exception ex)
+            {
+                ModLog.Error(
+                    $"V1.29 CreateUnitySubMesh failed: {ex}"
+                );
+
+                return 0;
+            }
+        }
+
+        // ============================================================
+        // MATERIAL PROPERTY BLOCK
+        // ============================================================
+
+        private void ApplyDiagnosticPropertyBlock(
+            MeshRenderer renderer,
+            Material[] materials,
+            int meshIndex
+        )
+        {
+            if (
+                renderer == null ||
+                materials == null ||
+                materials.Length == 0
+            )
+            {
+                return;
+            }
+
+            try
+            {
+                MaterialPropertyBlock block =
+                    new MaterialPropertyBlock();
+
+                int colossalPropertyCount =
+                    0;
+
+                for (
+                    int materialIndex = 0;
+                    materialIndex < materials.Length;
+                    materialIndex++
+                )
+                {
+                    Material material =
+                        materials[materialIndex];
+
+                    if (
+                        material == null ||
+                        material.shader == null
+                    )
+                    {
+                        continue;
+                    }
+
+                    Shader shader =
+                        material.shader;
+
+                    int propertyCount =
+                        shader.GetPropertyCount();
+
+                    for (
+                        int propertyIndex = 0;
+                        propertyIndex < propertyCount;
+                        propertyIndex++
+                    )
+                    {
+                        string propertyName =
+                            shader.GetPropertyName(
+                                propertyIndex
+                            );
+
+                        if (
+                            string.IsNullOrEmpty(
+                                propertyName
+                            ) ||
+                            !propertyName.StartsWith(
+                                "colossal_",
+                                StringComparison.OrdinalIgnoreCase
+                            )
+                        )
+                        {
+                            continue;
+                        }
+
+                        colossalPropertyCount++;
+
+                        ShaderPropertyType propertyType =
+                            shader.GetPropertyType(
+                                propertyIndex
+                            );
+
+                        CopyShaderProperty(
+                            block,
+                            material,
+                            propertyName,
+                            propertyType
+                        );
+                    }
+                }
+
+                renderer.SetPropertyBlock(
+                    block
+                );
+
+                ModLog.Info(
+                    $"V1.29 MPB mesh={meshIndex} " +
+                    $"colossalProperties={colossalPropertyCount}"
+                );
+            }
+            catch (Exception ex)
+            {
+                ModLog.Error(
+                    $"V1.29 MPB failed: {ex}"
+                );
+            }
+        }
+
+        private void CopyShaderProperty(
+            MaterialPropertyBlock block,
+            Material material,
+            string propertyName,
+            ShaderPropertyType propertyType
+        )
+        {
+            try
+            {
+                int propertyId =
+                    Shader.PropertyToID(
+                        propertyName
+                    );
+
+                switch (propertyType)
+                {
+                    case ShaderPropertyType.Float:
+                    case ShaderPropertyType.Range:
+                        block.SetFloat(
+                            propertyId,
+                            material.GetFloat(
+                                propertyId
+                            )
+                        );
+                        break;
+
+                    case ShaderPropertyType.Vector:
+                        block.SetVector(
+                            propertyId,
+                            material.GetVector(
+                                propertyId
+                            )
+                        );
+                        break;
+
+                    case ShaderPropertyType.Color:
+                        block.SetColor(
+                            propertyId,
+                            material.GetColor(
+                                propertyId
+                            )
+                        );
+                        break;
+
+                    case ShaderPropertyType.Texture:
+                        {
+                            Texture texture =
+                                material.GetTexture(
+                                    propertyId
+                                );
+
+                            if (texture != null)
+                            {
+                                block.SetTexture(
+                                    propertyId,
+                                    texture
+                                );
+                            }
+
+                            break;
+                        }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        // ============================================================
+        // GEOMETRY
+        // ============================================================
+
+        private GeometryAsset GetGeometryAsset(
+            object renderPrefab
+        )
+        {
+            if (renderPrefab == null)
+                return null;
+
+            try
+            {
+                FieldInfo field =
+                    renderPrefab
+                        .GetType()
+                        .GetField(
+                            "m_GeometryAsset",
+                            BindingFlags.Instance |
+                            BindingFlags.Public |
+                            BindingFlags.NonPublic
+                        );
+
+                if (field == null)
+                    return null;
+
+                object reference =
+                    field.GetValue(
+                        renderPrefab
+                    );
+
+                return ConvertAssetReference<
+                    GeometryAsset
+                >(
+                    reference
+                );
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        // ============================================================
+        // MATERIALS
+        // ============================================================
+
+        private Material[] LoadBestMaterials(
+            object renderPrefab
+        )
+        {
+            if (renderPrefab == null)
+                return Array.Empty<Material>();
+
+            try
+            {
+                FieldInfo field =
+                    renderPrefab
+                        .GetType()
+                        .GetField(
+                            "m_SurfaceAssets",
+                            BindingFlags.Instance |
+                            BindingFlags.Public |
+                            BindingFlags.NonPublic
+                        );
+
+                if (field == null)
+                    return Array.Empty<Material>();
+
+                Array references =
+                    field.GetValue(
+                        renderPrefab
+                    ) as Array;
+
+                if (references == null)
+                    return Array.Empty<Material>();
+
+                List<Material> result =
+                    new List<Material>();
+
+                for (
+                    int i = 0;
+                    i < references.Length;
+                    i++
+                )
+                {
+                    object reference =
+                        references.GetValue(i);
+
+                    SurfaceAsset surface =
+                        ConvertAssetReference<
+                            SurfaceAsset
+                        >(
+                            reference
+                        );
+
+                    if (surface == null)
+                        continue;
+
+                    Material material =
+                        LoadSurfaceBestEffort(
+                            surface,
+                            i
+                        );
+
+                    if (material == null)
+                        continue;
+
+                    result.Add(
+                        material
+                    );
+
+                    if (
+                        !m_LoadedSurfaceAssets.Contains(
+                            surface
+                        )
+                    )
+                    {
+                        m_LoadedSurfaceAssets.Add(
+                            surface
+                        );
+                    }
+
+                    ModLog.Info(
+                        $"V1.29 Surface[{i}] " +
+                        $"material={material.name}, " +
+                        $"shader={material.shader?.name}"
+                    );
+                }
+
+                return result.ToArray();
+            }
+            catch (Exception ex)
+            {
+                ModLog.Info(
+                    $"V1.29 LoadBestMaterials failed: " +
+                    $"{ex.GetType().Name}"
+                );
+
+                return Array.Empty<Material>();
+            }
+        }
+
+        private Material LoadSurfaceBestEffort(
+            SurfaceAsset surface,
+            int surfaceIndex
+        )
+        {
+            MethodInfo[] methods =
+                surface.GetType().GetMethods(
+                    BindingFlags.Instance |
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic
+                );
+
+            foreach (
+                MethodInfo method
+                in methods
+            )
+            {
+                if (
+                    method.Name != "Load" ||
+                    !typeof(Material)
+                        .IsAssignableFrom(
+                            method.ReturnType
+                        )
+                )
+                {
+                    continue;
+                }
+
+                ParameterInfo[] parameters =
+                    method.GetParameters();
+
+                if (
+                    parameters.Length != 4 ||
+                    parameters[0].ParameterType !=
+                        typeof(int) ||
+                    parameters[1].ParameterType !=
+                        typeof(bool) ||
+                    parameters[3].ParameterType !=
+                        typeof(bool)
+                )
+                {
+                    continue;
+                }
+
+                try
+                {
+                    object keepOnCpu =
+                        Activator.CreateInstance(
+                            parameters[2]
+                                .ParameterType
+                        );
+
+                    Material material =
+                        method.Invoke(
+                            surface,
+                            new object[]
+                            {
+                                0,
+                                true,
+                                keepOnCpu,
+                                true
+                            }
+                        ) as Material;
+
+                    if (material != null)
+                    {
+                        ModLog.Info(
+                            $"V1.29 Surface[{surfaceIndex}] " +
+                            $"Load(useVT=true) OK"
+                        );
+
+                        return material;
+                    }
+                }
+                catch
+                {
+                }
+
+                try
+                {
+                    object keepOnCpu =
+                        Activator.CreateInstance(
+                            parameters[2]
+                                .ParameterType
+                        );
+
+                    Material material =
+                        method.Invoke(
+                            surface,
+                            new object[]
+                            {
+                                0,
+                                true,
+                                keepOnCpu,
+                                false
+                            }
+                        ) as Material;
+
+                    if (material != null)
+                        return material;
+                }
+                catch
+                {
+                }
+            }
+
+            return null;
+        }
+
+        // ============================================================
+        // ASSET REFERENCES
+        // ============================================================
+
+        private static T ConvertAssetReference<T>(
+            object assetReference
+        )
+            where T : class
+        {
+            if (assetReference == null)
+                return null;
+
+            try
+            {
+                Type referenceType =
+                    assetReference.GetType();
+
+                MethodInfo[] methods =
+                    referenceType.GetMethods(
+                        BindingFlags.Static |
+                        BindingFlags.Public |
+                        BindingFlags.NonPublic
+                    );
+
+                foreach (
+                    MethodInfo method
+                    in methods
+                )
+                {
+                    if (
+                        method.Name != "op_Implicit" ||
+                        !typeof(T).IsAssignableFrom(
+                            method.ReturnType
+                        )
+                    )
+                    {
+                        continue;
+                    }
+
+                    ParameterInfo[] parameters =
+                        method.GetParameters();
+
+                    if (parameters.Length != 1)
+                        continue;
+
+                    object result =
+                        method.Invoke(
+                            null,
+                            new object[]
+                            {
+                                assetReference
+                            }
+                        );
+
+                    return result as T;
+                }
+            }
+            catch
+            {
+            }
+
+            return null;
+        }
+
+        // ============================================================
+        // MATERIAL MAPPING
+        // ============================================================
+
+        private static Material[]
+            BuildMaterialArray(
+                Mesh mesh,
+                Material[] materials,
+                int meshIndex
+            )
+        {
+            if (
+                mesh == null ||
+                materials == null ||
+                materials.Length == 0
+            )
+            {
+                return Array.Empty<Material>();
+            }
+
+            int subMeshCount =
+                Math.Max(
+                    1,
+                    mesh.subMeshCount
+                );
+
+            Material[] result =
+                new Material[
+                    subMeshCount
+                ];
+
+            for (
+                int subMeshIndex = 0;
+                subMeshIndex < subMeshCount;
+                subMeshIndex++
+            )
+            {
+                int materialIndex =
+                    Math.Min(
+                        meshIndex +
+                        subMeshIndex,
+                        materials.Length - 1
+                    );
+
+                result[subMeshIndex] =
+                    materials[materialIndex];
+            }
+
+            return result;
+        }
+
+        // ============================================================
+        // ECS VISUAL DATA COPY
+        // ============================================================
+
+        private void CopyVisualComponent<T>(
+            Entity source
+        )
+            where T : unmanaged,
+            IComponentData
+        {
+            if (
+                !EntityManager.HasComponent<T>(
+                    source
+                )
+            )
+            {
+                return;
+            }
+
+            T value =
+                EntityManager.GetComponentData<T>(
+                    source
+                );
+
+            if (
+                EntityManager.HasComponent<T>(
+                    m_VisualProxy
+                )
+            )
+            {
+                EntityManager.SetComponentData(
+                    m_VisualProxy,
+                    value
+                );
+            }
+            else
+            {
+                EntityManager.AddComponentData(
+                    m_VisualProxy,
+                    value
+                );
+            }
+        }
+
+        private void CopyMeshColorBuffer(
+            Entity source
+        )
+        {
+            if (
+                !EntityManager.HasBuffer<MeshColor>(
+                    m_VisualProxy
+                )
+            )
+            {
+                EntityManager.AddBuffer<MeshColor>(
+                    m_VisualProxy
+                );
+            }
+
+            DynamicBuffer<MeshColor> target =
+                EntityManager.GetBuffer<MeshColor>(
+                    m_VisualProxy
+                );
+
+            target.Clear();
+
+            if (
+                !EntityManager.HasBuffer<MeshColor>(
+                    source
+                )
+            )
+            {
+                return;
+            }
+
+            DynamicBuffer<MeshColor> sourceBuffer =
+                EntityManager.GetBuffer<MeshColor>(
+                    source
+                );
+
+            for (
+                int i = 0;
+                i < sourceBuffer.Length;
+                i++
+            )
+            {
+                target.Add(
+                    sourceBuffer[i]
+                );
+            }
+        }
+
+        private void CopyCustomMeshColorBuffer(
+            Entity source
+        )
+        {
+            if (
+                !EntityManager.HasBuffer<CustomMeshColor>(
+                    m_VisualProxy
+                )
+            )
+            {
+                EntityManager.AddBuffer<CustomMeshColor>(
+                    m_VisualProxy
+                );
+            }
+
+            DynamicBuffer<CustomMeshColor> target =
+                EntityManager.GetBuffer<CustomMeshColor>(
+                    m_VisualProxy
+                );
+
+            target.Clear();
+
+            if (
+                !EntityManager.HasBuffer<CustomMeshColor>(
+                    source
+                )
+            )
+            {
+                return;
+            }
+
+            DynamicBuffer<CustomMeshColor> sourceBuffer =
+                EntityManager.GetBuffer<CustomMeshColor>(
+                    source
+                );
+
+            for (
+                int i = 0;
+                i < sourceBuffer.Length;
+                i++
+            )
+            {
+                target.Add(
+                    sourceBuffer[i]
+                );
+            }
+        }
+
+        // ============================================================
+        // CLEANUP
+        // ============================================================
+
+        private void DestroyNativeProxy()
+        {
+            if (
+                m_VisualProxy != Entity.Null &&
+                EntityManager.Exists(
+                    m_VisualProxy
+                )
+            )
+            {
+                try
+                {
+                    EntityManager.DestroyEntity(
+                        m_VisualProxy
+                    );
+                }
+                catch
+                {
+                }
+            }
+
+            m_VisualProxy =
+                Entity.Null;
+        }
+
+        private void DestroyUnityCopy()
+        {
+            if (
+                m_UnityRoot != null
+            )
+            {
+                try
+                {
+                    UnityEngine.Object.Destroy(
+                        m_UnityRoot
+                    );
+                }
+                catch
+                {
+                }
+
+                m_UnityRoot =
+                    null;
+            }
+
+            foreach (
+                GeometryAsset geometry
+                in m_LoadedGeometryAssets
+            )
+            {
+                if (geometry == null)
+                    continue;
+
+                try
+                {
+                    geometry.ReleaseMeshes();
+                }
+                catch
+                {
+                }
+            }
+
+            m_LoadedGeometryAssets.Clear();
+
+            foreach (
+                SurfaceAsset surface
+                in m_LoadedSurfaceAssets
+            )
+            {
+                if (surface == null)
+                    continue;
+
+                TryUnloadSurface(
+                    surface
+                );
+            }
+
+            m_LoadedSurfaceAssets.Clear();
+        }
+
+        private static void TryUnloadSurface(
+            SurfaceAsset surface
+        )
+        {
+            try
+            {
+                MethodInfo[] methods =
+                    surface.GetType().GetMethods(
+                        BindingFlags.Instance |
+                        BindingFlags.Public |
+                        BindingFlags.NonPublic
+                    );
+
+                foreach (
+                    MethodInfo method
+                    in methods
+                )
+                {
+                    if (
+                        method.Name == "Unload" &&
+                        method.GetParameters()
+                            .Length == 0
+                    )
+                    {
+                        method.Invoke(
+                            surface,
+                            null
+                        );
+
+                        return;
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private void DestroyEverything()
+        {
+            DestroyNativeProxy();
+            DestroyUnityCopy();
+
+            m_TrackedBuilding =
+                Entity.Null;
+
+            m_UnityCopyAttempted =
+                false;
+
+            m_LastProgress =
+                255;
+        }
+
+        protected override void OnDestroy()
+        {
+            DestroyEverything();
+
+            base.OnDestroy();
+        }
+    }
+}

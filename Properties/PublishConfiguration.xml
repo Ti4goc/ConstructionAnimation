@@ -3,52 +3,36 @@
 	<!--Name of the mod to display to players-->
 	<DisplayName Value="Construction Animation" />
 	<!--Short description of the mod-->
-	<ShortDescription Value="Brings construction sites to life with buildings that rise progressively, animated scaffolding, floor-by-floor dismantling and tower cranes." />
+	<ShortDescription Value="Brings construction sites to life with progressively rising buildings, textured shadow-casting scaffolding, persistent tower cranes and animated site cleanup." />
 	<!--Long description of the mod. Single line or multi line. Supports minimal markdown subset-->
 	<LongDescription>
 # Construction Animation
 
-Remember watching buildings rise from the ground in the original Cities: Skylines? It was a small detail, but it made every new neighbourhood feel alive.
+Construction Animation makes building sites feel alive again in Cities: Skylines II.
 
-Then Cities: Skylines II arrived: bigger cities, more detailed buildings, improved simulation... and construction was represented by a finished building hiding beneath a flat patch of sand. If your first reaction was **"Wait, that's it?"**, you were definitely not alone.
+Buildings rise progressively as construction advances, using their native models and textures. Procedural scaffolding follows the building footprint and height, tower cranes appear on suitable projects, and construction lots receive a temporary dirt treatment instead of the vanilla sand surface.
 
-Construction Animation brings that missing sense of progress back. Active building sites look like real projects instead of finished buildings waiting underneath a construction surface.
-
-Buildings now rise smoothly from the ground as construction advances. Their native models and textures remain visible throughout the process, while procedural scaffolding follows the footprint and current height of each building.
-
-## Animated construction
-- Buildings rise progressively according to the game's real construction progress
-- Uses the building's native model and textures
-- Supports several simultaneous construction sites
-- Works automatically without requiring a tool or manual activation
-
-## Scaffolding
-- Procedural scaffolding follows the building footprint
-- Vertical posts, horizontal beams, diagonal braces and wooden platforms
-- Horizontal floor grids between storeys
-- Height and visible floors follow construction progress
-- Scaffolding is dismantled progressively from the top floor down
-- Original straight scaffold corners are used for better performance and cleaner geometry
-
-## Tower cranes
-- Tower cranes may appear on suitable construction sites
-- Cranes are positioned near a corner of the lot instead of intersecting the middle of the building
-- Crane placement and colour may vary between sites
-
-## Construction ground
-- The vanilla sand construction surface is removed while the animated construction is active
-- A dirt effect is applied across the construction lot and restored when construction finishes
+## Features
+- Progressive building construction
+- Native building textures and windows
+- Animated scaffolding that grows with the building
+- Scaffolding shadows and gradual dismantling after completion
+- Tower cranes placed near the edge of the construction lot
+- Temporary construction ground effects
+- Support for multiple simultaneous construction sites
+- Automatic cleanup when construction finishes
 
 ## Performance
-The system only tracks active construction sites and cleans up its temporary visual objects when construction ends. The experimental scaffold sheeting effect has been removed to avoid excessive transparent geometry and preserve performance on large cities.
+Several optimizations are included to reduce the impact of large construction sites and multiple simultaneous projects.
 
 ## Compatibility
 - Designed for Cities: Skylines II 1.6.x
-- No additional dependency is required
-- Existing buildings are not modified unless they are actively under construction
+- No additional dependencies required
 
 ## Beta
-This mod is currently in beta. Building assets vary greatly in shape and complexity, so occasional visual imperfections may still occur on unusual footprints. Feedback, screenshots and Player.log reports are welcome.
+This mod is still in beta. Some unusual building footprints may produce visual imperfections.
+
+⚠️ Construction Animation creates temporary procedural geometry during construction. Very large numbers of simultaneous building sites may still affect performance.
 
 ## Credits
 Created by Ti4goc. Developed in part with the assistance of AI tools.
@@ -59,27 +43,34 @@ Created by Ti4goc. Developed in part with the assistance of AI tools.
 	<Screenshot Value="C:\Dev\ConstructionAnimation\Properties\1.png" />
 	<Screenshot Value="C:\Dev\ConstructionAnimation\Properties\2.png" />
 	<Screenshot Value="C:\Dev\ConstructionAnimation\Properties\3.png" />
+	<Screenshot Value="C:\Dev\ConstructionAnimation\Properties\4.png" />
 	<!--Tag, can be set multiple times-->
 	<Tag Value="Code Mod" />
 	<!--Link to the forum post where the mod can be discussed-->
 	<ForumLink Value="" />
 	<!--Version of the mod-->
-	<ModVersion Value="0.1.0" />
+	<ModVersion Value="0.2.0" />
 	<!--Recommended version of the base game to use the mod-->
 	<GameVersion Value="1.6.*" />
 	<!--External link, can be set multiple times. supported types are "discord", "github", "youtube", "twitch", "x", "paypal", "patreon", "buymeacoffee", "kofi", "crowdin", "gitlab", "gofundme"-->
 	<ExternalLink Type="github" Url="https://github.com/Ti4goc/ConstructionAnimation" />
 	<!--Change log for new version. Single line or multi line. Supports minimal markdown subset-->
 	<ChangeLog>
-Initial beta release:
-- Buildings rise smoothly according to their real construction progress
-- Native building models and textures remain visible during construction
-- Procedural scaffolding with posts, beams, diagonal braces, wooden platforms and floor grids
-- Support for multiple simultaneous construction sites
-- Progressive floor-by-floor scaffold dismantling from top to bottom
-- Tower cranes positioned near lot corners to reduce building intersections
-- Automatic removal of vanilla sand construction surfaces
-- Dirt painting across the construction lot, restored when construction finishes
-- Performance-focused cleanup of temporary construction visuals
+Major construction and performance update:
+- Removes the vanilla Sand Surface safely during active construction
+- Adds a temporary dirt brush across the construction lot
+- Adds a low concrete foundation following the building footprint
+- Restores native façade textures and window rendering on the animated building
+- Makes construction façades double-sided to avoid hollow-looking exterior walls
+- Adds textured scaffolding with cast and received shadows
+- Keeps scaffolding in place until the building is fully completed
+- Adds a 1.5-second completion hold followed by a 1.5-second fade-out before dismantling starts
+- Dismantles scaffolding progressively only after the completed building is visible
+- Keeps suitable tower cranes available during construction and excludes small residential buildings and row houses
+- Repositions cranes near lot corners
+- Generates scaffold geometry directly instead of creating thousands of temporary primitive objects
+- Reduces building cut-mesh rebuild frequency with an adaptive update step
+- Optimizes scaffold animation updates to avoid processing every floor every frame
+- Extends full scaffold shadow distance to 650 m
 	</ChangeLog>
 </Publish>

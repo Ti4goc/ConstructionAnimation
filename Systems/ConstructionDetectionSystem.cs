@@ -29,6 +29,7 @@ namespace ConstructionAnimation.Systems
         private EntityQuery m_SurfaceQuery;
         private EntityQuery m_ConstructionSandAreaQuery;
         private PrefabSystem m_PrefabSystem;
+        private Game.Simulation.SimulationSystem m_SimulationSystem;
 
         // V1.43.46.8: restored from the published build.
         // This is the game's own terrain-material painting system, not a
@@ -44,6 +45,98 @@ namespace ConstructionAnimation.Systems
         private float m_NextTerrainSplatmapFlushTime;
 
         private bool m_SurfaceLayoutLogged;
+
+        // Lightweight in-game performance telemetry. Measurements are
+        // accumulated in memory and emitted as one report every 10 seconds so
+        // the profiler does not become the performance problem it measures.
+        private const float PerformanceReportInterval = 10f;
+
+        private float m_NextPerformanceReportTime;
+
+        private long m_PerfOnUpdateTicks;
+        private long m_PerfOnUpdateMaxTicks;
+        private int m_PerfOnUpdateCalls;
+
+        private long m_PerfDetectionTicks;
+        private long m_PerfDetectionMaxTicks;
+        private int m_PerfDetectionCalls;
+
+        private long m_PerfCreateTicks;
+        private long m_PerfCreateMaxTicks;
+        private int m_PerfCreateCalls;
+
+        private long m_PerfCreateGeometryTicks;
+        private long m_PerfCreateGeometryMaxTicks;
+        private int m_PerfCreateGeometryCalls;
+
+        private long m_PerfGeometryCacheHits;
+        private long m_PerfGeometryCacheMisses;
+
+        private long m_PerfCreateProxyTicks;
+        private long m_PerfCreateProxyMaxTicks;
+        private int m_PerfCreateProxyCalls;
+
+        private long m_PerfCreateFoldedTicks;
+        private long m_PerfCreateFoldedMaxTicks;
+        private int m_PerfCreateFoldedCalls;
+
+        private long m_PerfCutoffTemplateHits;
+        private long m_PerfCutoffTemplateMisses;
+
+        private long m_PerfCreateTerrainTicks;
+        private long m_PerfCreateTerrainMaxTicks;
+        private int m_PerfCreateTerrainCalls;
+
+        private long m_PerfCreateBrandingTicks;
+        private long m_PerfCreateBrandingMaxTicks;
+        private int m_PerfCreateBrandingCalls;
+
+        private long m_PerfBuildingTicks;
+        private long m_PerfBuildingMaxTicks;
+        private int m_PerfBuildingCalls;
+
+        private long m_PerfCutoffTicks;
+        private long m_PerfCutoffMaxTicks;
+        private int m_PerfCutoffCalls;
+        private int m_PerfCutoffRebuilds;
+        private long m_PerfCutoffRebuildsSkipped;
+
+        private long m_PerfScaffoldTicks;
+        private long m_PerfScaffoldMaxTicks;
+        private int m_PerfScaffoldCalls;
+
+        private long m_PerfScaffoldCreateTicks;
+        private long m_PerfScaffoldCreateMaxTicks;
+        private int m_PerfScaffoldCreateCalls;
+        private long m_PerfScaffoldMeshesBuilt;
+        private long m_PerfScaffoldMeshesReused;
+
+        private long m_PerfCraneTicks;
+        private long m_PerfCraneMaxTicks;
+        private int m_PerfCraneCalls;
+
+        private long m_PerfTerrainTicks;
+        private long m_PerfTerrainMaxTicks;
+        private int m_PerfTerrainCalls;
+
+        private long m_PerfCleanupTicks;
+        private long m_PerfCleanupMaxTicks;
+        private int m_PerfCleanupCalls;
+
+        // V1.43.47.4.3.14.8: explicit visual culling / throttling telemetry.
+        private readonly Plane[] m_CameraFrustumPlanes =
+            new Plane[6];
+
+        private long m_FrustumPlanesUpdateSequence =
+            -1;
+
+        private Camera m_FrustumPlanesCamera;
+
+        private long m_PerfCullingVisualUpdatesSkipped;
+        private long m_PerfCullingScaffoldUpdatesSkipped;
+        private long m_PerfCullingCraneUpdatesSkipped;
+        private long m_PerfCullingFarThrottledUpdates;
+
 
         private readonly HashSet<int> m_LoggedBuildingRenderPrefabs =
             new HashSet<int>();
@@ -113,6 +206,13 @@ namespace ConstructionAnimation.Systems
         {
             public GameObject Root;
             public Mesh RuntimeMesh;
+            public MeshRenderer Renderer;
+
+            // MeshColorSystem creates colors in prefab submesh order. For the
+            // normal building path this is the source SubMesh index; grouped
+            // prefabs are resolved through MeshGroup/SubMeshGroup below.
+            public int SourceColorSubMeshIndex = -1;
+            public int SourceColorMeshIndex = -1;
 
             public Vector3[] SourceVertices =
                 new Vector3[0];
@@ -171,6 +271,9 @@ namespace ConstructionAnimation.Systems
             public readonly List<CutoffVertexData> RuntimeClipped =
                 new List<CutoffVertexData>(4);
 
+            public readonly List<CutoffVertexData> RuntimeClippedLower =
+                new List<CutoffVertexData>(6);
+
             public readonly List<int> RuntimePolygonIndices =
                 new List<int>(4);
 
@@ -185,6 +288,65 @@ namespace ConstructionAnimation.Systems
 
             public int SourceSubMeshIndex;
             public string SourcePrefabName;
+        }
+
+        private sealed class CutoffPrefabMeshTemplate
+        {
+            public Entity RenderPrefabEntity =
+                Entity.Null;
+
+            public int SourceSubMeshIndex;
+            public int SourceMeshIndex;
+            public int MaterialStartIndex;
+            public int SourceSubMeshCount;
+
+            public string SourcePrefabName;
+
+            public Vector3[] SourceVertices =
+                new Vector3[0];
+
+            public Vector3[] SourceNormals =
+                new Vector3[0];
+
+            public Vector4[] SourceTangents =
+                new Vector4[0];
+
+            public Vector4[][] SourceUVChannels =
+                new Vector4[8][];
+
+            public bool[] HasUVChannels =
+                new bool[8];
+
+            public UnityEngine.Color[] SourceColors =
+                new UnityEngine.Color[0];
+
+            public int[][] SourceSubMeshTriangles =
+                new int[0][];
+
+            public bool HasNormals;
+            public bool HasTangents;
+            public bool HasColors;
+
+            public float MinY;
+            public float MaxY;
+
+            public int SourceVertexCount;
+            public int SourceTriangleCount;
+        }
+
+        private sealed class CutoffPrefabTemplate
+        {
+            public readonly List<CutoffPrefabMeshTemplate> Meshes =
+                new List<CutoffPrefabMeshTemplate>();
+
+            public float MinY =
+                float.MaxValue;
+
+            public float MaxY =
+                float.MinValue;
+
+            public int TotalVertices;
+            public int TotalTriangles;
         }
 
         private sealed class ScaffoldGeometryBuffer
@@ -224,6 +386,13 @@ namespace ConstructionAnimation.Systems
             public List<CutoffMeshVisual> CutoffMeshes =
                 new List<CutoffMeshVisual>();
 
+            public List<CutoffMeshVisual> FacadeCutoffMeshes =
+                new List<CutoffMeshVisual>();
+
+            public int FacadeCompletedFloorCount = -1;
+
+            public float FacadeRevealHeight;
+
             public float CutoffLocalMinY;
 
             public float CutoffLocalMaxY;
@@ -231,6 +400,10 @@ namespace ConstructionAnimation.Systems
             public float LastCutoffHeight;
 
             public bool HasCutoffHeight;
+
+            public bool ForceCutoffResync;
+
+            public int CutoffDistanceBand = -1;
 
             public float LastCutoffLoggedProgress = -1f;
 
@@ -275,6 +448,8 @@ namespace ConstructionAnimation.Systems
             public float NextConstructionSandAreaScanTime;
 
             public bool TerrainDirtPainted;
+
+            public float NextTerrainDirtRefreshTime;
 
             public float3 TerrainPaintPosition;
 
@@ -376,6 +551,19 @@ namespace ConstructionAnimation.Systems
 
             public float NextScaffoldDistanceCheckTime;
 
+            public int ScaffoldLodStep = 1;
+
+            public bool FrustumVisible =
+                true;
+
+            public bool VisualDistanceCulled;
+
+            public float CameraDistance;
+
+            public float NextVisualCullingCheckTime;
+
+            public float NextHeavyVisualUpdateTime;
+
             public Entity CompanyEntity =
                 Entity.Null;
 
@@ -395,22 +583,42 @@ namespace ConstructionAnimation.Systems
             public Entity CraneEntity =
                 Entity.Null;
 
+            public Entity VanillaCraneEntity =
+                Entity.Null;
+
             public bool CranePositionLogged;
 
             public bool CraneVerticalOffsetCaptured;
 
             public float CraneVerticalOffset;
 
-            public Entity CraneBackupEntity =
-                Entity.Null;
-
-            public bool CraneUsingBackup;
-
             public bool CraneEligibilityEvaluated;
 
             public bool CraneEligible = true;
 
             public string CraneSourcePrefabName;
+
+            public bool CranePlacementCached;
+
+            public Vector2 CraneLocalPosition =
+                Vector2.zero;
+
+            public int CraneCornerIndex = -1;
+
+            public quaternion CraneLocalRotation =
+                quaternion.identity;
+
+            public bool CranePointOfInterestInitialized;
+
+            public uint CraneNextPointOfInterestFrame;
+
+            public int CranePointOfInterestSequence;
+
+            public float CompletionHoldDuration =
+                CompletedAssetHoldDuration;
+
+            public float DismantleDuration =
+                ScaffoldDismantleDuration;
 
             public float VisualProgress;
 
@@ -536,6 +744,20 @@ namespace ConstructionAnimation.Systems
             }
         }
 
+        private sealed class PrefabGeometryCacheEntry
+        {
+            public float BuildingHeight;
+            public float3 BuildingSize;
+            public float3 GeometryPivot;
+            public bool HasLotDimensions;
+            public float LotHalfWidth;
+            public float LotHalfDepth;
+            public List<Vector2> Footprint;
+            public List<Vector3> StructureTriangleVertices;
+            public float StructureGeometryBaseY;
+            public List<float> FloorBoundaries;
+        }
+
         private sealed class HiddenVanillaSurface
         {
             public Entity Entity =
@@ -578,6 +800,14 @@ namespace ConstructionAnimation.Systems
         private readonly Dictionary<Entity, ConstructionVisual>
             m_Visuals =
                 new Dictionary<Entity, ConstructionVisual>();
+
+        private readonly Dictionary<Entity, PrefabGeometryCacheEntry>
+            m_PrefabGeometryCache =
+                new Dictionary<Entity, PrefabGeometryCacheEntry>();
+
+        private readonly Dictionary<Entity, CutoffPrefabTemplate>
+            m_CutoffPrefabTemplateCache =
+                new Dictionary<Entity, CutoffPrefabTemplate>();
 
         private readonly List<Entity>
             m_RemoveSources =
@@ -701,10 +931,10 @@ namespace ConstructionAnimation.Systems
             6.50f;
 
         private const float ScaffoldMinimumCullDistance =
-            500f;
+            1450f;
 
         private const float ScaffoldMaximumCullDistance =
-            900f;
+            1600f;
 
         private const float ScaffoldCullDistancePerHeightMetre =
             2.20f;
@@ -721,17 +951,66 @@ namespace ConstructionAnimation.Systems
         private const float CraneLotEdgeInset =
             1.25f;
 
+        // Prefer the same lot corner by default. Only nearby active cranes
+        // can make the selector move to another corner.
+        private const int CranePreferredCornerIndex =
+            0;
+
+        // Approximate horizontal safety envelope for neighbouring crane jibs.
+        // The vanilla upper structure still follows PointOfInterest, so the
+        // base placement maximises separation before that animation begins.
+        private const float CraneNeighbourSafetyRadius =
+            70f;
+
         private const float CraneLowResidentialMaximumHeight =
             12f;
 
         private const float CraneBackupParkDepth =
             5000f;
 
+        private const float TerrainDirtRefreshMinimumSeconds =
+            2f;
+
+        private const float TerrainDirtRefreshMaximumSeconds =
+            3f;
+
+        // Vanilla BuildingConstructionSystem updates crane POI targets from
+        // simulation time. Its system runs every 64 simulation frames and
+        // retargets with a 10% chance, i.e. roughly every 640 frames on
+        // average. We keep a deterministic 320-960 frame interval around
+        // that vanilla mean so pause/simulation speed are respected.
+        private const uint CraneTargetMinimumIntervalFrames =
+            320u;
+
+        private const uint CraneTargetMaximumIntervalFrames =
+            960u;
+
         private const float ScaffoldDistanceCheckInterval =
             0.35f;
 
+        private const float VisualCullingCheckInterval =
+            0.10f;
+
+        private const float VisualFrustumHorizontalMargin =
+            20f;
+
+        private const float VisualFrustumVerticalMargin =
+            15f;
+
+        private const float VisualFarUpdateInterval =
+            0.20f;
+
+        private const float VisualVeryFarDistance =
+            1500f;
+
         private const float ScaffoldShadowCullDistance =
             650f;
+
+        private const float ScaffoldMediumLodDistance =
+            700f;
+
+        private const float ScaffoldFarLodDistance =
+            1000f;
 
         private const float DiagnosticHeartbeatInterval =
             2.0f;
@@ -777,6 +1056,9 @@ namespace ConstructionAnimation.Systems
 
             m_PrefabSystem =
                 World.GetOrCreateSystemManaged<PrefabSystem>();
+
+            m_SimulationSystem =
+                World.GetOrCreateSystemManaged<Game.Simulation.SimulationSystem>();
 
             m_TerrainMaterialSystem =
                 World.GetOrCreateSystemManaged<TerrainMaterialSystem>();
@@ -1300,12 +1582,16 @@ namespace ConstructionAnimation.Systems
         }
 
         private void ApplyPublishedTerrainDirt(
-            ConstructionVisual visual
+            ConstructionVisual visual,
+            bool forceRefresh = false
         )
         {
             if (
                 visual == null ||
-                visual.TerrainDirtPainted ||
+                (
+                    visual.TerrainDirtPainted &&
+                    !forceRefresh
+                ) ||
                 visual.Source == Entity.Null ||
                 !EntityManager.Exists(
                     visual.Source
@@ -1476,18 +1762,37 @@ namespace ConstructionAnimation.Systems
                 visual.TerrainPaintAngle =
                     angle;
 
-                ModLog.Checkpoint(
-                    "TERRAIN-PAINT dirt applied; source=" +
-                    visual.Source.Index +
-                    ":" +
-                    visual.Source.Version +
-                    "; width=" +
-                    width.ToString("0.00") +
-                    "; depth=" +
-                    depth.ToString("0.00") +
-                    "; angle=" +
-                    angle.ToString("0.000")
-                );
+                float refreshUnit =
+                    DeterministicUnit(
+                        visual.Source.Index,
+                        7103
+                    );
+
+                visual.NextTerrainDirtRefreshTime =
+                    global::UnityEngine.Time.unscaledTime +
+                    Mathf.Lerp(
+                        TerrainDirtRefreshMinimumSeconds,
+                        TerrainDirtRefreshMaximumSeconds,
+                        refreshUnit
+                    );
+
+                if (
+                    !forceRefresh
+                )
+                {
+                    ModLog.Checkpoint(
+                        "TERRAIN-PAINT dirt applied; source=" +
+                        visual.Source.Index +
+                        ":" +
+                        visual.Source.Version +
+                        "; width=" +
+                        width.ToString("0.00") +
+                        "; depth=" +
+                        depth.ToString("0.00") +
+                        "; angle=" +
+                        angle.ToString("0.000")
+                    );
+                }
             }
             catch (Exception ex)
             {
@@ -1498,8 +1803,170 @@ namespace ConstructionAnimation.Systems
             }
         }
 
-        private void ClearPublishedTerrainDirt(
+        private void RefreshPublishedTerrainDirtIfDue(
             ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null ||
+                !visual.TerrainDirtPainted ||
+                global::UnityEngine.Time.unscaledTime <
+                visual.NextTerrainDirtRefreshTime
+            )
+            {
+                return;
+            }
+
+            ApplyPublishedTerrainDirt(
+                visual,
+                true
+            );
+        }
+
+        private static void GetTerrainPaintWorldAabb(
+            ConstructionVisual visual,
+            out float minX,
+            out float maxX,
+            out float minZ,
+            out float maxZ
+        )
+        {
+            float halfWidth =
+                Mathf.Max(
+                    0.25f,
+                    visual.TerrainPaintWidth *
+                    0.5f
+                );
+
+            float halfDepth =
+                Mathf.Max(
+                    0.25f,
+                    visual.TerrainPaintDepth *
+                    0.5f
+                );
+
+            float cos =
+                Mathf.Abs(
+                    Mathf.Cos(
+                        visual.TerrainPaintAngle
+                    )
+                );
+
+            float sin =
+                Mathf.Abs(
+                    Mathf.Sin(
+                        visual.TerrainPaintAngle
+                    )
+                );
+
+            float extentX =
+                halfWidth *
+                cos +
+                halfDepth *
+                sin;
+
+            float extentZ =
+                halfWidth *
+                sin +
+                halfDepth *
+                cos;
+
+            minX =
+                visual.TerrainPaintPosition.x -
+                extentX;
+
+            maxX =
+                visual.TerrainPaintPosition.x +
+                extentX;
+
+            minZ =
+                visual.TerrainPaintPosition.z -
+                extentZ;
+
+            maxZ =
+                visual.TerrainPaintPosition.z +
+                extentZ;
+        }
+
+        private bool HasOverlappingActiveTerrainPaint(
+            ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null ||
+                !visual.TerrainDirtPainted
+            )
+            {
+                return false;
+            }
+
+            float minX;
+            float maxX;
+            float minZ;
+            float maxZ;
+
+            GetTerrainPaintWorldAabb(
+                visual,
+                out minX,
+                out maxX,
+                out minZ,
+                out maxZ
+            );
+
+            foreach (
+                ConstructionVisual other
+                in m_Visuals.Values
+            )
+            {
+                if (
+                    other == null ||
+                    ReferenceEquals(
+                        other,
+                        visual
+                    ) ||
+                    !other.TerrainDirtPainted ||
+                    other.Source == Entity.Null ||
+                    !EntityManager.Exists(
+                        other.Source
+                    )
+                )
+                {
+                    continue;
+                }
+
+                float otherMinX;
+                float otherMaxX;
+                float otherMinZ;
+                float otherMaxZ;
+
+                GetTerrainPaintWorldAabb(
+                    other,
+                    out otherMinX,
+                    out otherMaxX,
+                    out otherMinZ,
+                    out otherMaxZ
+                );
+
+                bool overlaps =
+                    minX <= otherMaxX &&
+                    maxX >= otherMinX &&
+                    minZ <= otherMaxZ &&
+                    maxZ >= otherMinZ;
+
+                if (
+                    overlaps
+                )
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void ClearPublishedTerrainDirt(
+            ConstructionVisual visual,
+            bool forceClear = false
         )
         {
             if (
@@ -1511,6 +1978,26 @@ namespace ConstructionAnimation.Systems
                 m_RectangleBrushPrefab == Entity.Null
             )
             {
+                return;
+            }
+
+            if (
+                !forceClear &&
+                HasOverlappingActiveTerrainPaint(
+                    visual
+                )
+            )
+            {
+                visual.TerrainDirtPainted =
+                    false;
+
+                visual.NextTerrainDirtRefreshTime =
+                    0f;
+
+                ModLog.Checkpoint(
+                    "TERRAIN-PAINT clear skipped; overlapping active construction"
+                );
+
                 return;
             }
 
@@ -1528,6 +2015,9 @@ namespace ConstructionAnimation.Systems
 
                 visual.TerrainDirtPainted =
                     false;
+
+                visual.NextTerrainDirtRefreshTime =
+                    0f;
 
                 ModLog.Checkpoint(
                     "TERRAIN-PAINT cleared"
@@ -3101,8 +3591,656 @@ namespace ConstructionAnimation.Systems
             }
         }
 
+        private static long PerfTimestamp()
+        {
+            return System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+
+        private static double PerfMilliseconds(
+            long ticks
+        )
+        {
+            return
+                ticks *
+                1000.0 /
+                System.Diagnostics.Stopwatch.Frequency;
+        }
+
+        private static void PerfAdd(
+            ref long totalTicks,
+            ref long maxTicks,
+            ref int calls,
+            long startTicks
+        )
+        {
+            long elapsed =
+                PerfTimestamp() -
+                startTicks;
+
+            totalTicks +=
+                elapsed;
+
+            calls++;
+
+            if (
+                elapsed >
+                maxTicks
+            )
+            {
+                maxTicks =
+                    elapsed;
+            }
+        }
+
+        private static string PerfFormat(
+            long totalTicks,
+            long maxTicks,
+            int calls
+        )
+        {
+            double averageMs =
+                calls > 0
+                    ? PerfMilliseconds(
+                        totalTicks
+                    ) /
+                    calls
+                    : 0.0;
+
+            double maxMs =
+                PerfMilliseconds(
+                    maxTicks
+                );
+
+            return
+                "avg=" +
+                averageMs.ToString(
+                    "0.000"
+                ) +
+                "ms max=" +
+                maxMs.ToString(
+                    "0.000"
+                ) +
+                "ms calls=" +
+                calls;
+        }
+
+        private void WritePerformanceReportIfDue(
+            bool force = false
+        )
+        {
+            float now =
+                global::UnityEngine.Time.unscaledTime;
+
+            if (
+                !force &&
+                now <
+                m_NextPerformanceReportTime
+            )
+            {
+                return;
+            }
+
+            m_NextPerformanceReportTime =
+                now +
+                PerformanceReportInterval;
+
+            int activeSites =
+                m_Visuals.Count;
+
+            int scaffoldSites =
+                0;
+
+            int scaffoldMeshes =
+                0;
+
+            int scaffoldRenderers =
+                0;
+
+            long scaffoldVertices =
+                0;
+
+            long scaffoldTriangles =
+                0;
+
+            int scaffoldShadowSites =
+                0;
+
+            int lodFull =
+                0;
+
+            int lodMedium =
+                0;
+
+            int lodFar =
+                0;
+
+            int activeCranes =
+                0;
+
+            int cullingVisibleSites =
+                0;
+
+            int cullingOutsideFrustumSites =
+                0;
+
+            int cullingDistanceCulledSites =
+                0;
+
+            float cameraDistanceMin =
+                float.MaxValue;
+
+            float cameraDistanceMax =
+                0f;
+
+            double cameraDistanceTotal =
+                0.0;
+
+            int cameraDistanceSamples =
+                0;
+
+            int buildingMeshes =
+                0;
+
+            long buildingVertices =
+                0;
+
+            long buildingTriangles =
+                0;
+
+            foreach (
+                ConstructionVisual visual
+                in m_Visuals.Values
+            )
+            {
+                if (
+                    visual ==
+                    null
+                )
+                {
+                    continue;
+                }
+
+                if (
+                    !visual.FrustumVisible
+                )
+                {
+                    cullingOutsideFrustumSites++;
+                }
+
+                if (
+                    visual.VisualDistanceCulled
+                )
+                {
+                    cullingDistanceCulledSites++;
+                }
+
+                if (
+                    visual.FrustumVisible &&
+                    !visual.VisualDistanceCulled
+                )
+                {
+                    cullingVisibleSites++;
+                }
+
+                if (
+                    visual.CameraDistance >
+                    0.001f
+                )
+                {
+                    cameraDistanceMin =
+                        Mathf.Min(
+                            cameraDistanceMin,
+                            visual.CameraDistance
+                        );
+
+                    cameraDistanceMax =
+                        Mathf.Max(
+                            cameraDistanceMax,
+                            visual.CameraDistance
+                        );
+
+                    cameraDistanceTotal +=
+                        visual.CameraDistance;
+
+                    cameraDistanceSamples++;
+                }
+
+                if (
+                    visual.ScaffoldMeshes.Count >
+                    0
+                )
+                {
+                    scaffoldSites++;
+                }
+
+                scaffoldMeshes +=
+                    visual.ScaffoldMeshes.Count;
+
+                scaffoldRenderers +=
+                    visual.ScaffoldRenderers.Count;
+
+                if (
+                    visual.ScaffoldShadowsEnabled
+                )
+                {
+                    scaffoldShadowSites++;
+                }
+
+                if (
+                    visual.ScaffoldLodStep <=
+                    1
+                )
+                {
+                    lodFull++;
+                }
+                else if (
+                    visual.ScaffoldLodStep ==
+                    2
+                )
+                {
+                    lodMedium++;
+                }
+                else
+                {
+                    lodFar++;
+                }
+
+                for (
+                    int i = 0;
+                    i <
+                    visual.ScaffoldMeshes.Count;
+                    i++
+                )
+                {
+                    Mesh mesh =
+                        visual.ScaffoldMeshes[i];
+
+                    if (
+                        mesh ==
+                        null
+                    )
+                    {
+                        continue;
+                    }
+
+                    scaffoldVertices +=
+                        mesh.vertexCount;
+
+                    for (
+                        int subMesh = 0;
+                        subMesh <
+                        mesh.subMeshCount;
+                        subMesh++
+                    )
+                    {
+                        scaffoldTriangles +=
+                            (long)
+                            mesh.GetIndexCount(
+                                subMesh
+                            ) /
+                            3L;
+                    }
+                }
+
+                buildingMeshes +=
+                    visual.BuildingVisualMeshes.Count;
+
+                for (
+                    int i = 0;
+                    i <
+                    visual.BuildingVisualMeshes.Count;
+                    i++
+                )
+                {
+                    Mesh mesh =
+                        visual.BuildingVisualMeshes[i];
+
+                    if (
+                        mesh ==
+                        null
+                    )
+                    {
+                        continue;
+                    }
+
+                    buildingVertices +=
+                        mesh.vertexCount;
+
+                    for (
+                        int subMesh = 0;
+                        subMesh <
+                        mesh.subMeshCount;
+                        subMesh++
+                    )
+                    {
+                        buildingTriangles +=
+                            (long)
+                            mesh.GetIndexCount(
+                                subMesh
+                            ) /
+                            3L;
+                    }
+                }
+
+                if (
+                    visual.CraneEntity !=
+                    Entity.Null
+                )
+                {
+                    activeCranes++;
+                }
+            }
+
+            double intervalTotalMs =
+                PerfMilliseconds(
+                    m_PerfOnUpdateTicks
+                );
+
+            double cutoffShare =
+                intervalTotalMs > 0.0
+                    ? PerfMilliseconds(
+                        m_PerfCutoffTicks
+                    ) /
+                    intervalTotalMs *
+                    100.0
+                    : 0.0;
+
+            double scaffoldShare =
+                intervalTotalMs > 0.0
+                    ? PerfMilliseconds(
+                        m_PerfScaffoldTicks
+                    ) /
+                    intervalTotalMs *
+                    100.0
+                    : 0.0;
+
+            double craneShare =
+                intervalTotalMs > 0.0
+                    ? PerfMilliseconds(
+                        m_PerfCraneTicks
+                    ) /
+                    intervalTotalMs *
+                    100.0
+                    : 0.0;
+
+            double terrainShare =
+                intervalTotalMs > 0.0
+                    ? PerfMilliseconds(
+                        m_PerfTerrainTicks
+                    ) /
+                    intervalTotalMs *
+                    100.0
+                    : 0.0;
+
+            ModLog.Checkpoint(
+                "[PERF] interval=" +
+                PerformanceReportInterval.ToString(
+                    "0"
+                ) +
+                "s" +
+                "\n  TOTAL OnUpdate " +
+                PerfFormat(
+                    m_PerfOnUpdateTicks,
+                    m_PerfOnUpdateMaxTicks,
+                    m_PerfOnUpdateCalls
+                ) +
+                " activeSites=" +
+                activeSites +
+                "\n  DETECTION " +
+                PerfFormat(
+                    m_PerfDetectionTicks,
+                    m_PerfDetectionMaxTicks,
+                    m_PerfDetectionCalls
+                ) +
+                "\n  CREATE visual " +
+                PerfFormat(
+                    m_PerfCreateTicks,
+                    m_PerfCreateMaxTicks,
+                    m_PerfCreateCalls
+                ) +
+                "\n  CREATE geometry " +
+                PerfFormat(
+                    m_PerfCreateGeometryTicks,
+                    m_PerfCreateGeometryMaxTicks,
+                    m_PerfCreateGeometryCalls
+                ) +
+                " geometryCache(hits/misses)=" +
+                m_PerfGeometryCacheHits +
+                "/" +
+                m_PerfGeometryCacheMisses +
+                "\n  CREATE proxy " +
+                PerfFormat(
+                    m_PerfCreateProxyTicks,
+                    m_PerfCreateProxyMaxTicks,
+                    m_PerfCreateProxyCalls
+                ) +
+                "\n  CREATE cutoff " +
+                PerfFormat(
+                    m_PerfCreateFoldedTicks,
+                    m_PerfCreateFoldedMaxTicks,
+                    m_PerfCreateFoldedCalls
+                ) +
+                " cutoffTemplate(hits/misses)=" +
+                m_PerfCutoffTemplateHits +
+                "/" +
+                m_PerfCutoffTemplateMisses +
+                "\n  CREATE terrain " +
+                PerfFormat(
+                    m_PerfCreateTerrainTicks,
+                    m_PerfCreateTerrainMaxTicks,
+                    m_PerfCreateTerrainCalls
+                ) +
+                "\n  CREATE branding " +
+                PerfFormat(
+                    m_PerfCreateBrandingTicks,
+                    m_PerfCreateBrandingMaxTicks,
+                    m_PerfCreateBrandingCalls
+                ) +
+                "\n  BUILDING update " +
+                PerfFormat(
+                    m_PerfBuildingTicks,
+                    m_PerfBuildingMaxTicks,
+                    m_PerfBuildingCalls
+                ) +
+                "\n  CUTOFF " +
+                PerfFormat(
+                    m_PerfCutoffTicks,
+                    m_PerfCutoffMaxTicks,
+                    m_PerfCutoffCalls
+                ) +
+                " rebuilds=" +
+                m_PerfCutoffRebuilds +
+                " rebuildsSkipped=" +
+                m_PerfCutoffRebuildsSkipped +
+                " share=" +
+                cutoffShare.ToString(
+                    "0.0"
+                ) +
+                "%" +
+                "\n  SCAFFOLD update " +
+                PerfFormat(
+                    m_PerfScaffoldTicks,
+                    m_PerfScaffoldMaxTicks,
+                    m_PerfScaffoldCalls
+                ) +
+                " share=" +
+                scaffoldShare.ToString(
+                    "0.0"
+                ) +
+                "%" +
+                "\n  SCAFFOLD create " +
+                PerfFormat(
+                    m_PerfScaffoldCreateTicks,
+                    m_PerfScaffoldCreateMaxTicks,
+                    m_PerfScaffoldCreateCalls
+                ) +
+                " meshesBuilt=" +
+                m_PerfScaffoldMeshesBuilt +
+                " meshesReused=" +
+                m_PerfScaffoldMeshesReused +
+                "\n  CRANE " +
+                PerfFormat(
+                    m_PerfCraneTicks,
+                    m_PerfCraneMaxTicks,
+                    m_PerfCraneCalls
+                ) +
+                " share=" +
+                craneShare.ToString(
+                    "0.0"
+                ) +
+                "%" +
+                "\n  TERRAIN " +
+                PerfFormat(
+                    m_PerfTerrainTicks,
+                    m_PerfTerrainMaxTicks,
+                    m_PerfTerrainCalls
+                ) +
+                " share=" +
+                terrainShare.ToString(
+                    "0.0"
+                ) +
+                "%" +
+                "\n  CLEANUP " +
+                PerfFormat(
+                    m_PerfCleanupTicks,
+                    m_PerfCleanupMaxTicks,
+                    m_PerfCleanupCalls
+                ) +
+                "\n  CULLING visible=" +
+                cullingVisibleSites +
+                " outsideFrustum=" +
+                cullingOutsideFrustumSites +
+                " distanceCulled=" +
+                cullingDistanceCulledSites +
+                " visualUpdatesSkipped=" +
+                m_PerfCullingVisualUpdatesSkipped +
+                " scaffoldUpdatesSkipped=" +
+                m_PerfCullingScaffoldUpdatesSkipped +
+                " craneUpdatesSkipped=" +
+                m_PerfCullingCraneUpdatesSkipped +
+                " farThrottled=" +
+                m_PerfCullingFarThrottledUpdates +
+                " cameraDistance(min/avg/max)=" +
+                (
+                    cameraDistanceSamples > 0
+                        ? cameraDistanceMin.ToString("0") +
+                          "/" +
+                          (
+                              cameraDistanceTotal /
+                              cameraDistanceSamples
+                          ).ToString("0") +
+                          "/" +
+                          cameraDistanceMax.ToString("0") +
+                          "m"
+                        : "n/a"
+                ) +
+                "\n  GPU-LOAD scaffoldSites=" +
+                scaffoldSites +
+                " meshes=" +
+                scaffoldMeshes +
+                " renderers=" +
+                scaffoldRenderers +
+                " vertices=" +
+                scaffoldVertices +
+                " triangles=" +
+                scaffoldTriangles +
+                " shadowSites=" +
+                scaffoldShadowSites +
+                " lod(full/medium/far)=" +
+                lodFull +
+                "/" +
+                lodMedium +
+                "/" +
+                lodFar +
+                "\n  GPU-LOAD buildingMeshes=" +
+                buildingMeshes +
+                " vertices=" +
+                buildingVertices +
+                " triangles=" +
+                buildingTriangles +
+                " cranes=" +
+                activeCranes
+            );
+
+            m_PerfOnUpdateTicks = 0;
+            m_PerfOnUpdateMaxTicks = 0;
+            m_PerfOnUpdateCalls = 0;
+
+            m_PerfDetectionTicks = 0;
+            m_PerfDetectionMaxTicks = 0;
+            m_PerfDetectionCalls = 0;
+
+            m_PerfCreateTicks = 0;
+            m_PerfCreateMaxTicks = 0;
+            m_PerfCreateCalls = 0;
+
+            m_PerfCreateGeometryTicks = 0;
+            m_PerfCreateGeometryMaxTicks = 0;
+            m_PerfCreateGeometryCalls = 0;
+            m_PerfGeometryCacheHits = 0;
+            m_PerfGeometryCacheMisses = 0;
+
+            m_PerfCreateProxyTicks = 0;
+            m_PerfCreateProxyMaxTicks = 0;
+            m_PerfCreateProxyCalls = 0;
+
+            m_PerfCreateFoldedTicks = 0;
+            m_PerfCreateFoldedMaxTicks = 0;
+            m_PerfCreateFoldedCalls = 0;
+            m_PerfCutoffTemplateHits = 0;
+            m_PerfCutoffTemplateMisses = 0;
+
+            m_PerfCreateTerrainTicks = 0;
+            m_PerfCreateTerrainMaxTicks = 0;
+            m_PerfCreateTerrainCalls = 0;
+
+            m_PerfCreateBrandingTicks = 0;
+            m_PerfCreateBrandingMaxTicks = 0;
+            m_PerfCreateBrandingCalls = 0;
+
+            m_PerfBuildingTicks = 0;
+            m_PerfBuildingMaxTicks = 0;
+            m_PerfBuildingCalls = 0;
+
+            m_PerfCutoffTicks = 0;
+            m_PerfCutoffMaxTicks = 0;
+            m_PerfCutoffCalls = 0;
+            m_PerfCutoffRebuilds = 0;
+            m_PerfCutoffRebuildsSkipped = 0;
+
+            m_PerfScaffoldTicks = 0;
+            m_PerfScaffoldMaxTicks = 0;
+            m_PerfScaffoldCalls = 0;
+
+            m_PerfScaffoldCreateTicks = 0;
+            m_PerfScaffoldCreateMaxTicks = 0;
+            m_PerfScaffoldCreateCalls = 0;
+            m_PerfScaffoldMeshesBuilt = 0;
+            m_PerfScaffoldMeshesReused = 0;
+
+            m_PerfCraneTicks = 0;
+            m_PerfCraneMaxTicks = 0;
+            m_PerfCraneCalls = 0;
+
+            m_PerfTerrainTicks = 0;
+            m_PerfTerrainMaxTicks = 0;
+            m_PerfTerrainCalls = 0;
+
+            m_PerfCleanupTicks = 0;
+            m_PerfCleanupMaxTicks = 0;
+            m_PerfCleanupCalls = 0;
+
+            m_PerfCullingVisualUpdatesSkipped = 0;
+            m_PerfCullingScaffoldUpdatesSkipped = 0;
+            m_PerfCullingCraneUpdatesSkipped = 0;
+            m_PerfCullingFarThrottledUpdates = 0;
+        }
+
         protected override void OnUpdate()
         {
+            long perfOnUpdateStart =
+                PerfTimestamp();
+
             m_DiagnosticUpdateSequence++;
 
             try
@@ -3126,10 +4264,20 @@ namespace ConstructionAnimation.Systems
 
                 m_QuerySourcesThisFrame.Clear();
 
+                long perfDetectionStart =
+                    PerfTimestamp();
+
                 using NativeArray<Entity> buildings =
                     m_BuildingQuery.ToEntityArray(
                         Allocator.Temp
                     );
+
+                PerfAdd(
+                    ref m_PerfDetectionTicks,
+                    ref m_PerfDetectionMaxTicks,
+                    ref m_PerfDetectionCalls,
+                    perfDetectionStart
+                );
 
                 WriteDiagnosticHeartbeatIfDue(
                     buildings.Length
@@ -3209,10 +4357,20 @@ namespace ConstructionAnimation.Systems
                                 source
                             );
 
+                            long perfCreateStart =
+                                PerfTimestamp();
+
                             visual =
                                 CreateConstructionVisual(
                                     source
                                 );
+
+                            PerfAdd(
+                                ref m_PerfCreateTicks,
+                                ref m_PerfCreateMaxTicks,
+                                ref m_PerfCreateCalls,
+                                perfCreateStart
+                            );
 
                             if (
                                 visual == null
@@ -3234,8 +4392,18 @@ namespace ConstructionAnimation.Systems
                     visual.MissingFrames =
                         0;
 
+                    long perfBuildingStart =
+                        PerfTimestamp();
+
                     UpdateConstructionVisual(
                         visual
+                    );
+
+                    PerfAdd(
+                        ref m_PerfBuildingTicks,
+                        ref m_PerfBuildingMaxTicks,
+                        ref m_PerfBuildingCalls,
+                        perfBuildingStart
                     );
                 }
 
@@ -3375,8 +4543,18 @@ namespace ConstructionAnimation.Systems
                         source
                     );
 
+                    long perfCleanupStart =
+                        PerfTimestamp();
+
                     DestroyConstructionVisual(
                         visual
+                    );
+
+                    PerfAdd(
+                        ref m_PerfCleanupTicks,
+                        ref m_PerfCleanupMaxTicks,
+                        ref m_PerfCleanupCalls,
+                        perfCleanupStart
                     );
 
                     m_Visuals.Remove(
@@ -3390,6 +4568,15 @@ namespace ConstructionAnimation.Systems
                     "update.end",
                     Entity.Null
                 );
+
+                PerfAdd(
+                    ref m_PerfOnUpdateTicks,
+                    ref m_PerfOnUpdateMaxTicks,
+                    ref m_PerfOnUpdateCalls,
+                    perfOnUpdateStart
+                );
+
+                WritePerformanceReportIfDue();
             }
             catch (Exception ex)
             {
@@ -3731,6 +4918,26 @@ namespace ConstructionAnimation.Systems
                 visual.Source =
                     source;
 
+                visual.CompletionHoldDuration =
+                    Mathf.Lerp(
+                        1.20f,
+                        2.00f,
+                        DeterministicUnit(
+                            source.Index,
+                            17
+                        )
+                    );
+
+                visual.DismantleDuration =
+                    Mathf.Lerp(
+                        8.50f,
+                        12.00f,
+                        DeterministicUnit(
+                            source.Index,
+                            29
+                        )
+                    );
+
                 SetDiagnosticStage(
                     "create.begin",
                     source
@@ -3766,19 +4973,46 @@ namespace ConstructionAnimation.Systems
                 visual.VisualProgressVelocity =
                     0f;
 
-                ReadBuildingGeometry(
-                    prefabRef.m_Prefab,
-                    visual
-                );
+                long perfCreateGeometryStart =
+                    PerfTimestamp();
 
-                ReadBuildingLotDimensions(
-                    prefabRef.m_Prefab,
-                    visual
-                );
+                bool geometryCacheHit =
+                    TryApplyCachedPrefabGeometry(
+                        prefabRef.m_Prefab,
+                        visual
+                    );
 
-                AnalyseBuildingMeshes(
-                    prefabRef.m_Prefab,
-                    visual
+                if (
+                    geometryCacheHit
+                )
+                {
+                    m_PerfGeometryCacheHits++;
+                }
+                else
+                {
+                    m_PerfGeometryCacheMisses++;
+
+                    ReadBuildingGeometry(
+                        prefabRef.m_Prefab,
+                        visual
+                    );
+
+                    ReadBuildingLotDimensions(
+                        prefabRef.m_Prefab,
+                        visual
+                    );
+
+                    AnalyseBuildingMeshes(
+                        prefabRef.m_Prefab,
+                        visual
+                    );
+                }
+
+                PerfAdd(
+                    ref m_PerfCreateGeometryTicks,
+                    ref m_PerfCreateGeometryMaxTicks,
+                    ref m_PerfCreateGeometryCalls,
+                    perfCreateGeometryStart
                 );
 
                 // Sand Surface suppression is independent from terrain painting.
@@ -3813,6 +5047,16 @@ namespace ConstructionAnimation.Systems
                     visual
                 );
 
+                if (
+                    !geometryCacheHit
+                )
+                {
+                    StorePrefabGeometryCache(
+                        prefabRef.m_Prefab,
+                        visual
+                    );
+                }
+
                 // V1.43.47.4.3.14: the cutoff path no longer consumes procedural
                 // per-floor volume profiles. Keep AnalyseBuildingMeshes for
                 // footprint/scaffold geometry, but skip this expensive dead work.
@@ -3829,14 +5073,34 @@ namespace ConstructionAnimation.Systems
                     source.Version
                 );
 
+                long perfCreateProxyStart =
+                    PerfTimestamp();
+
                 CreateNativeProxy(
                     visual,
                     prefabRef
                 );
 
+                PerfAdd(
+                    ref m_PerfCreateProxyTicks,
+                    ref m_PerfCreateProxyMaxTicks,
+                    ref m_PerfCreateProxyCalls,
+                    perfCreateProxyStart
+                );
+
+                long perfCreateFoldedStart =
+                    PerfTimestamp();
+
                 CreateFoldedBuildingVisual(
                     visual,
                     prefabRef.m_Prefab
+                );
+
+                PerfAdd(
+                    ref m_PerfCreateFoldedTicks,
+                    ref m_PerfCreateFoldedMaxTicks,
+                    ref m_PerfCreateFoldedCalls,
+                    perfCreateFoldedStart
                 );
 
                 // Roof reconstruction also consumes the principal asset triangles.
@@ -3859,17 +5123,50 @@ namespace ConstructionAnimation.Systems
                     source
                 );
 
+                long perfScaffoldCreateStart =
+                    PerfTimestamp();
+
                 CreateScaffold(
                     visual
+                );
+
+                PerfAdd(
+                    ref m_PerfScaffoldCreateTicks,
+                    ref m_PerfScaffoldCreateMaxTicks,
+                    ref m_PerfScaffoldCreateCalls,
+                    perfScaffoldCreateStart
                 );
 
                 // V1.43.47.4.3.14: the vanilla Sand Surface is suppressed by
                 // the dedicated early lifecycle system. Paint only our dirt
                 // brush here and keep it until the full temporary construction
                 // visual, including scaffold dismantling, has finished.
+                long perfTerrainStart =
+                    PerfTimestamp();
+
+                long perfCreateTerrainStart =
+                    perfTerrainStart;
+
                 ApplyPublishedTerrainDirt(
                     visual
                 );
+
+                PerfAdd(
+                    ref m_PerfTerrainTicks,
+                    ref m_PerfTerrainMaxTicks,
+                    ref m_PerfTerrainCalls,
+                    perfTerrainStart
+                );
+
+                PerfAdd(
+                    ref m_PerfCreateTerrainTicks,
+                    ref m_PerfCreateTerrainMaxTicks,
+                    ref m_PerfCreateTerrainCalls,
+                    perfCreateTerrainStart
+                );
+
+                long perfCreateBrandingStart =
+                    PerfTimestamp();
 
                 visual.BrandingEligible =
                     IsBrandingEligibleBuilding(
@@ -3884,6 +5181,13 @@ namespace ConstructionAnimation.Systems
                         visual
                     );
                 }
+
+                PerfAdd(
+                    ref m_PerfCreateBrandingTicks,
+                    ref m_PerfCreateBrandingMaxTicks,
+                    ref m_PerfCreateBrandingCalls,
+                    perfCreateBrandingStart
+                );
 
                 ModLog.Checkpoint(
                     "CREATE complete; source=" +
@@ -4586,6 +5890,141 @@ namespace ConstructionAnimation.Systems
                     $"{ex.GetType().Name}: {ex.Message}"
                 );
             }
+        }
+
+        private bool TryApplyCachedPrefabGeometry(
+            Entity prefab,
+            ConstructionVisual visual
+        )
+        {
+            if (
+                prefab == Entity.Null ||
+                visual == null
+            )
+            {
+                return false;
+            }
+
+            PrefabGeometryCacheEntry cached;
+
+            if (
+                !m_PrefabGeometryCache.TryGetValue(
+                    prefab,
+                    out cached
+                ) ||
+                cached == null
+            )
+            {
+                return false;
+            }
+
+            visual.BuildingHeight =
+                cached.BuildingHeight;
+
+            visual.BuildingSize =
+                cached.BuildingSize;
+
+            visual.GeometryPivot =
+                cached.GeometryPivot;
+
+            visual.HasLotDimensions =
+                cached.HasLotDimensions;
+
+            visual.LotHalfWidth =
+                cached.LotHalfWidth;
+
+            visual.LotHalfDepth =
+                cached.LotHalfDepth;
+
+            visual.Footprint =
+                cached.Footprint != null
+                    ? new List<Vector2>(
+                        cached.Footprint
+                    )
+                    : new List<Vector2>();
+
+            visual.StructureTriangleVertices =
+                cached.StructureTriangleVertices != null
+                    ? new List<Vector3>(
+                        cached.StructureTriangleVertices
+                    )
+                    : new List<Vector3>();
+
+            visual.StructureGeometryBaseY =
+                cached.StructureGeometryBaseY;
+
+            visual.FloorBoundaries =
+                cached.FloorBoundaries != null
+                    ? new List<float>(
+                        cached.FloorBoundaries
+                    )
+                    : new List<float>();
+
+            return true;
+        }
+
+        private void StorePrefabGeometryCache(
+            Entity prefab,
+            ConstructionVisual visual
+        )
+        {
+            if (
+                prefab == Entity.Null ||
+                visual == null
+            )
+            {
+                return;
+            }
+
+            PrefabGeometryCacheEntry cached =
+                new PrefabGeometryCacheEntry();
+
+            cached.BuildingHeight =
+                visual.BuildingHeight;
+
+            cached.BuildingSize =
+                visual.BuildingSize;
+
+            cached.GeometryPivot =
+                visual.GeometryPivot;
+
+            cached.HasLotDimensions =
+                visual.HasLotDimensions;
+
+            cached.LotHalfWidth =
+                visual.LotHalfWidth;
+
+            cached.LotHalfDepth =
+                visual.LotHalfDepth;
+
+            cached.Footprint =
+                visual.Footprint != null
+                    ? new List<Vector2>(
+                        visual.Footprint
+                    )
+                    : new List<Vector2>();
+
+            cached.StructureTriangleVertices =
+                visual.StructureTriangleVertices != null
+                    ? new List<Vector3>(
+                        visual.StructureTriangleVertices
+                    )
+                    : new List<Vector3>();
+
+            cached.StructureGeometryBaseY =
+                visual.StructureGeometryBaseY;
+
+            cached.FloorBoundaries =
+                visual.FloorBoundaries != null
+                    ? new List<float>(
+                        visual.FloorBoundaries
+                    )
+                    : new List<float>();
+
+            m_PrefabGeometryCache[
+                prefab
+            ] =
+                cached;
         }
 
         private void ReadBuildingGeometry(
@@ -9558,6 +10997,513 @@ namespace ConstructionAnimation.Systems
             );
         }
 
+        private static int GetCutoffDistanceBand(
+            float cameraDistance
+        )
+        {
+            if (
+                cameraDistance <=
+                250f
+            )
+            {
+                return 0;
+            }
+
+            if (
+                cameraDistance <=
+                500f
+            )
+            {
+                return 1;
+            }
+
+            if (
+                cameraDistance <=
+                700f
+            )
+            {
+                return 2;
+            }
+
+            return 3;
+        }
+
+        private float GetAdaptiveCutoffRebuildHeightThreshold(
+            ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null
+            )
+            {
+                return
+                    CutoffHeightUpdateMaximumThreshold;
+            }
+
+            float baseThreshold =
+                Mathf.Clamp(
+                    visual.BuildingHeight /
+                    Mathf.Max(
+                        CutoffTargetVerticalSteps,
+                        1f
+                    ),
+                    CutoffHeightUpdateMinimumThreshold,
+                    CutoffHeightUpdateMaximumThreshold
+                );
+
+            float normalizedBase =
+                Mathf.InverseLerp(
+                    CutoffHeightUpdateMinimumThreshold,
+                    CutoffHeightUpdateMaximumThreshold,
+                    baseThreshold
+                );
+
+            float minThreshold;
+            float maxThreshold;
+
+            switch (
+                GetCutoffDistanceBand(
+                    visual.CameraDistance
+                )
+            )
+            {
+                case 0:
+                    minThreshold = 0.30f;
+                    maxThreshold = 0.65f;
+                    break;
+
+                case 1:
+                    minThreshold = 0.60f;
+                    maxThreshold = 1.00f;
+                    break;
+
+                case 2:
+                    minThreshold = 1.00f;
+                    maxThreshold = 1.50f;
+                    break;
+
+                default:
+                    minThreshold = 1.50f;
+                    maxThreshold = 2.50f;
+                    break;
+            }
+
+            return
+                Mathf.Lerp(
+                    minThreshold,
+                    maxThreshold,
+                    normalizedBase
+                );
+        }
+
+        private float GetAdaptiveScaffoldCullDistance(
+            ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null
+            )
+            {
+                return
+                    ScaffoldMinimumCullDistance;
+            }
+
+            float footprintSize =
+                Mathf.Max(
+                    visual.BuildingSize.x,
+                    visual.BuildingSize.z
+                );
+
+            return
+                Mathf.Clamp(
+                    ScaffoldMinimumCullDistance +
+                    visual.BuildingHeight *
+                    ScaffoldCullDistancePerHeightMetre +
+                    footprintSize,
+                    ScaffoldMinimumCullDistance,
+                    ScaffoldMaximumCullDistance
+                );
+        }
+
+        private bool PrepareCameraFrustumPlanes(
+            Camera renderCamera
+        )
+        {
+            if (
+                renderCamera == null
+            )
+            {
+                return false;
+            }
+
+            if (
+                m_FrustumPlanesUpdateSequence ==
+                    m_DiagnosticUpdateSequence &&
+                m_FrustumPlanesCamera ==
+                    renderCamera
+            )
+            {
+                return true;
+            }
+
+            try
+            {
+                GeometryUtility.CalculateFrustumPlanes(
+                    renderCamera,
+                    m_CameraFrustumPlanes
+                );
+
+                m_FrustumPlanesUpdateSequence =
+                    m_DiagnosticUpdateSequence;
+
+                m_FrustumPlanesCamera =
+                    renderCamera;
+
+                return true;
+            }
+            catch
+            {
+                m_FrustumPlanesUpdateSequence =
+                    -1;
+
+                m_FrustumPlanesCamera =
+                    null;
+
+                return false;
+            }
+        }
+
+        private Bounds GetConstructionVisualBounds(
+            ConstructionVisual visual,
+            Game.Objects.Transform sourceTransform
+        )
+        {
+            float width =
+                Mathf.Max(
+                    visual.BuildingSize.x +
+                    VisualFrustumHorizontalMargin *
+                    2f,
+                    VisualFrustumHorizontalMargin *
+                    2f
+                );
+
+            float depth =
+                Mathf.Max(
+                    visual.BuildingSize.z +
+                    VisualFrustumHorizontalMargin *
+                    2f,
+                    VisualFrustumHorizontalMargin *
+                    2f
+                );
+
+            float height =
+                Mathf.Max(
+                    visual.BuildingHeight +
+                    VisualFrustumVerticalMargin *
+                    2f,
+                    VisualFrustumVerticalMargin *
+                    2f
+                );
+
+            Vector3 center =
+                new Vector3(
+                    sourceTransform.m_Position.x,
+                    sourceTransform.m_Position.y +
+                    visual.BuildingHeight *
+                    0.5f,
+                    sourceTransform.m_Position.z
+                );
+
+            return
+                new Bounds(
+                    center,
+                    new Vector3(
+                        width,
+                        height,
+                        depth
+                    )
+                );
+        }
+
+        private void ApplyConstructionCullingActivation(
+            ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null
+            )
+            {
+                return;
+            }
+
+            bool buildingActive =
+                visual.FrustumVisible;
+
+            if (
+                visual.BuildingVisualRoot != null &&
+                visual.BuildingVisualRoot.activeSelf !=
+                    buildingActive
+            )
+            {
+                visual.BuildingVisualRoot.SetActive(
+                    buildingActive
+                );
+            }
+
+            bool scaffoldActive =
+                visual.FrustumVisible &&
+                !visual.VisualDistanceCulled &&
+                visual.ScaffoldDistanceVisible;
+
+            if (
+                visual.ScaffoldRoot != null &&
+                visual.ScaffoldRoot.activeSelf !=
+                    scaffoldActive
+            )
+            {
+                visual.ScaffoldRoot.SetActive(
+                    scaffoldActive
+                );
+            }
+        }
+
+        private void UpdateConstructionCullingState(
+            ConstructionVisual visual,
+            Game.Objects.Transform sourceTransform
+        )
+        {
+            if (
+                visual == null
+            )
+            {
+                return;
+            }
+
+            float now =
+                global::UnityEngine.Time.unscaledTime;
+
+            if (
+                now <
+                visual.NextVisualCullingCheckTime
+            )
+            {
+                return;
+            }
+
+            bool wasEffectivelyCulled =
+                !visual.FrustumVisible ||
+                visual.VisualDistanceCulled;
+
+            Camera renderCamera =
+                GetRenderCamera(
+                    now
+                );
+
+            if (
+                renderCamera == null
+            )
+            {
+                visual.FrustumVisible =
+                    true;
+
+                visual.VisualDistanceCulled =
+                    false;
+
+                visual.CameraDistance =
+                    0f;
+
+                visual.NextVisualCullingCheckTime =
+                    now +
+                    0.25f;
+
+                ApplyConstructionCullingActivation(
+                    visual
+                );
+
+                if (
+                    wasEffectivelyCulled
+                )
+                {
+                    visual.NextHeavyVisualUpdateTime =
+                        0f;
+                }
+
+                return;
+            }
+
+            Vector3 cameraPosition =
+                renderCamera.transform.position;
+
+            Vector3 constructionCenter =
+                new Vector3(
+                    sourceTransform.m_Position.x,
+                    sourceTransform.m_Position.y +
+                    visual.BuildingHeight *
+                    0.5f,
+                    sourceTransform.m_Position.z
+                );
+
+            visual.CameraDistance =
+                Vector3.Distance(
+                    cameraPosition,
+                    constructionCenter
+                );
+
+            int currentCutoffDistanceBand =
+                GetCutoffDistanceBand(
+                    visual.CameraDistance
+                );
+
+            if (
+                visual.CutoffDistanceBand >= 0 &&
+                currentCutoffDistanceBand <
+                    visual.CutoffDistanceBand
+            )
+            {
+                visual.ForceCutoffResync =
+                    true;
+            }
+
+            visual.CutoffDistanceBand =
+                currentCutoffDistanceBand;
+
+            float cullDistance =
+                GetAdaptiveScaffoldCullDistance(
+                    visual
+                );
+
+            visual.VisualDistanceCulled =
+                visual.VisualDistanceCulled
+                    ? visual.CameraDistance >
+                      cullDistance -
+                      ScaffoldCullHysteresis
+                    : visual.CameraDistance >
+                      cullDistance +
+                      ScaffoldCullHysteresis;
+
+            bool frustumVisible =
+                true;
+
+            if (
+                PrepareCameraFrustumPlanes(
+                    renderCamera
+                )
+            )
+            {
+                Bounds bounds =
+                    GetConstructionVisualBounds(
+                        visual,
+                        sourceTransform
+                    );
+
+                frustumVisible =
+                    GeometryUtility.TestPlanesAABB(
+                        m_CameraFrustumPlanes,
+                        bounds
+                    );
+            }
+
+            visual.FrustumVisible =
+                frustumVisible;
+
+            bool nowEffectivelyCulled =
+                !visual.FrustumVisible ||
+                visual.VisualDistanceCulled;
+
+            float cullingCheckInterval =
+                !visual.FrustumVisible &&
+                visual.CameraDistance >=
+                    VisualVeryFarDistance
+                    ? 1f
+                    : !visual.FrustumVisible ||
+                      visual.VisualDistanceCulled
+                        ? 0.5f
+                        : visual.CameraDistance >
+                          ScaffoldShadowCullDistance
+                            ? VisualFarUpdateInterval
+                            : VisualCullingCheckInterval;
+
+            visual.NextVisualCullingCheckTime =
+                now +
+                cullingCheckInterval +
+                Mathf.Abs(
+                    visual.Source.Index %
+                    7
+                ) *
+                0.007f;
+
+            if (
+                wasEffectivelyCulled &&
+                !nowEffectivelyCulled
+            )
+            {
+                // Force a full visual resynchronisation immediately after the
+                // site comes back into view.
+                visual.NextHeavyVisualUpdateTime =
+                    0f;
+
+                visual.ForceCutoffResync =
+                    true;
+            }
+
+            ApplyConstructionCullingActivation(
+                visual
+            );
+        }
+
+        private bool ShouldRunHeavyVisualUpdate(
+            ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null
+            )
+            {
+                return false;
+            }
+
+            if (
+                !visual.FrustumVisible ||
+                visual.VisualDistanceCulled
+            )
+            {
+                return false;
+            }
+
+            if (
+                visual.CameraDistance <=
+                ScaffoldShadowCullDistance
+            )
+            {
+                return true;
+            }
+
+            float now =
+                global::UnityEngine.Time.unscaledTime;
+
+            if (
+                now <
+                visual.NextHeavyVisualUpdateTime
+            )
+            {
+                m_PerfCullingFarThrottledUpdates++;
+
+                return false;
+            }
+
+            float interval =
+                visual.CameraDistance >=
+                VisualVeryFarDistance
+                    ? 1f
+                    : VisualFarUpdateInterval;
+
+            visual.NextHeavyVisualUpdateTime =
+                now +
+                interval;
+
+            return true;
+        }
+
         private void UpdateConstructionVisual(
             ConstructionVisual visual
         )
@@ -9614,10 +11560,29 @@ namespace ConstructionAnimation.Systems
                     visual.Source
                 );
 
+            long perfTerrainRefreshStart =
+                PerfTimestamp();
+
+            RefreshPublishedTerrainDirtIfDue(
+                visual
+            );
+
+            PerfAdd(
+                ref m_PerfTerrainTicks,
+                ref m_PerfTerrainMaxTicks,
+                ref m_PerfTerrainCalls,
+                perfTerrainRefreshStart
+            );
+
             UnderConstruction construction =
                 EntityManager.GetComponentData<UnderConstruction>(
                     visual.Source
                 );
+
+            UpdateConstructionCullingState(
+                visual,
+                sourceTransform
+            );
 
             float targetProgress =
                 math.saturate(
@@ -9673,43 +11638,79 @@ namespace ConstructionAnimation.Systems
                 );
             }
 
-            SetDiagnosticStage(
-                "update.proxy",
-                visual.Source
-            );
+            bool runHeavyVisualUpdate =
+                ShouldRunHeavyVisualUpdate(
+                    visual
+                );
 
-            UpdateBuildingProxy(
-                visual,
-                sourceTransform,
-                visual.VisualProgress
-            );
+            if (
+                runHeavyVisualUpdate
+            )
+            {
+                SetDiagnosticStage(
+                    "update.proxy",
+                    visual.Source
+                );
 
-            UpdateFoldedBuildingVisual(
-                visual,
-                sourceTransform,
-                visual.VisualProgress
-            );
+                UpdateBuildingProxy(
+                    visual,
+                    sourceTransform,
+                    visual.VisualProgress
+                );
 
-            SetDiagnosticStage(
-                "update.scaffold",
-                visual.Source
-            );
+                UpdateFoldedBuildingVisual(
+                    visual,
+                    sourceTransform,
+                    visual.VisualProgress
+                );
 
-            UpdateScaffold(
-                visual,
-                sourceTransform,
-                visual.VisualProgress
-            );
+                SetDiagnosticStage(
+                    "update.scaffold",
+                    visual.Source
+                );
 
-            SetDiagnosticStage(
-                "update.crane",
-                visual.Source
-            );
+                long perfScaffoldStart =
+                    PerfTimestamp();
 
-            UpdateCranePosition(
-                visual,
-                sourceTransform
-            );
+                UpdateScaffold(
+                    visual,
+                    sourceTransform,
+                    visual.VisualProgress
+                );
+
+                PerfAdd(
+                    ref m_PerfScaffoldTicks,
+                    ref m_PerfScaffoldMaxTicks,
+                    ref m_PerfScaffoldCalls,
+                    perfScaffoldStart
+                );
+
+                SetDiagnosticStage(
+                    "update.crane",
+                    visual.Source
+                );
+
+                long perfCraneStart =
+                    PerfTimestamp();
+
+                UpdateCranePosition(
+                    visual,
+                    sourceTransform
+                );
+
+                PerfAdd(
+                    ref m_PerfCraneTicks,
+                    ref m_PerfCraneMaxTicks,
+                    ref m_PerfCraneCalls,
+                    perfCraneStart
+                );
+            }
+            else
+            {
+                m_PerfCullingVisualUpdatesSkipped++;
+                m_PerfCullingScaffoldUpdatesSkipped++;
+                m_PerfCullingCraneUpdatesSkipped++;
+            }
 
             LogProgress(
                 visual,
@@ -9908,23 +11909,129 @@ namespace ConstructionAnimation.Systems
             }
         }
 
-        private void ApplySourceMeshColorToFoldedBuilding(
+        private static void SetRendererColorMasks(
+            MeshRenderer renderer,
+            UnityEngine.Color channel0,
+            UnityEngine.Color channel1,
+            UnityEngine.Color channel2
+        )
+        {
+            if (
+                renderer == null
+            )
+            {
+                return;
+            }
+
+            MaterialPropertyBlock block =
+                new MaterialPropertyBlock();
+
+            renderer.GetPropertyBlock(
+                block
+            );
+
+            block.SetColor(
+                "colossal_ColorMask0",
+                channel0
+            );
+
+            block.SetColor(
+                "colossal_ColorMask1",
+                channel1
+            );
+
+            block.SetColor(
+                "colossal_ColorMask2",
+                channel2
+            );
+
+            renderer.SetPropertyBlock(
+                block
+            );
+        }
+
+        private void ApplyNeutralBuildingColorMasks(
             ConstructionVisual visual
         )
         {
+            if (
+                visual == null ||
+                visual.CutoffMeshes == null
+            )
+            {
+                return;
+            }
+
+            UnityEngine.Color neutral =
+                UnityEngine.Color.white;
+
+            int applied =
+                0;
+
+            for (
+                int i = 0;
+                i < visual.CutoffMeshes.Count;
+                i++
+            )
+            {
+                CutoffMeshVisual cutoff =
+                    visual.CutoffMeshes[i];
+
+                if (
+                    cutoff == null ||
+                    cutoff.Renderer == null
+                )
+                {
+                    continue;
+                }
+
+                SetRendererColorMasks(
+                    cutoff.Renderer,
+                    neutral,
+                    neutral,
+                    neutral
+                );
+
+                applied++;
+            }
+
+            ModLog.Checkpoint(
+                "CONSTRUCTION-COLOR neutral; source=" +
+                visual.Source.Index +
+                ":" +
+                visual.Source.Version +
+                "; renderers=" +
+                applied
+            );
+        }
+
+        private bool TryGetMeshColorForSubMesh(
+            ConstructionVisual visual,
+            int sourceSubMeshIndex,
+            int sourceMeshIndex,
+            out MeshColor meshColor,
+            out int resolvedColorIndex
+        )
+        {
+            meshColor =
+                default(MeshColor);
+
+            resolvedColorIndex =
+                -1;
+
             if (
                 visual == null ||
                 visual.Source == Entity.Null ||
                 !EntityManager.Exists(
                     visual.Source
                 ) ||
-                visual.BuildingVisualRoot == null ||
+                sourceMeshIndex < 0 ||
                 !EntityManager.HasBuffer<MeshColor>(
                     visual.Source
                 )
             )
             {
-                return;
+                return false;
             }
 
             DynamicBuffer<MeshColor> colors =
@@ -9936,173 +12043,242 @@ namespace ConstructionAnimation.Systems
                 colors.Length <= 0
             )
             {
-                return;
+                return false;
             }
+
+            // BatchDataSystem uses meshBatch.m_MeshIndex as the base color
+            // index, then adds MeshGroup.m_ColorOffset when a group is active.
+            int colorIndex =
+                sourceMeshIndex;
 
             try
             {
-                object boxedMeshColor =
-                    colors[0];
-
-                FieldInfo colorSetField =
-                    boxedMeshColor
-                        .GetType()
-                        .GetField(
-                            "m_ColorSet",
-                            BindingFlags.Instance |
-                            BindingFlags.Public |
-                            BindingFlags.NonPublic
-                        );
-
-                object colorSet =
-                    colorSetField != null
-                        ? colorSetField.GetValue(
-                            boxedMeshColor
-                        )
-                        : null;
-
                 if (
-                    colorSet == null
+                    EntityManager.HasComponent<PrefabRef>(
+                        visual.Source
+                    )
                 )
                 {
-                    return;
-                }
-
-                Type colorSetType =
-                    colorSet.GetType();
-
-                FieldInfo channel0Field =
-                    colorSetType.GetField(
-                        "m_Channel0",
-                        BindingFlags.Instance |
-                        BindingFlags.Public |
-                        BindingFlags.NonPublic
-                    );
-
-                FieldInfo channel1Field =
-                    colorSetType.GetField(
-                        "m_Channel1",
-                        BindingFlags.Instance |
-                        BindingFlags.Public |
-                        BindingFlags.NonPublic
-                    );
-
-                FieldInfo channel2Field =
-                    colorSetType.GetField(
-                        "m_Channel2",
-                        BindingFlags.Instance |
-                        BindingFlags.Public |
-                        BindingFlags.NonPublic
-                    );
-
-                if (
-                    channel0Field == null ||
-                    channel1Field == null ||
-                    channel2Field == null
-                )
-                {
-                    return;
-                }
-
-                UnityEngine.Color channel0 =
-                    (UnityEngine.Color)
-                    channel0Field.GetValue(
-                        colorSet
-                    );
-
-                UnityEngine.Color channel1 =
-                    (UnityEngine.Color)
-                    channel1Field.GetValue(
-                        colorSet
-                    );
-
-                UnityEngine.Color channel2 =
-                    (UnityEngine.Color)
-                    channel2Field.GetValue(
-                        colorSet
-                    );
-
-                MeshRenderer[] renderers =
-                    visual.BuildingVisualRoot
-                        .GetComponentsInChildren<MeshRenderer>(
-                            true
+                    PrefabRef prefabRef =
+                        EntityManager.GetComponentData<PrefabRef>(
+                            visual.Source
                         );
-
-                for (
-                    int i = 0;
-                    i < renderers.Length;
-                    i++
-                )
-                {
-                    MeshRenderer renderer =
-                        renderers[i];
 
                     if (
-                        renderer == null
+                        prefabRef.m_Prefab != Entity.Null &&
+                        EntityManager.Exists(
+                            prefabRef.m_Prefab
+                        ) &&
+                        EntityManager.HasBuffer<MeshGroup>(
+                            visual.Source
+                        ) &&
+                        EntityManager.HasBuffer<SubMeshGroup>(
+                            prefabRef.m_Prefab
+                        )
                     )
                     {
-                        continue;
+                        DynamicBuffer<MeshGroup> meshGroups =
+                            EntityManager.GetBuffer<MeshGroup>(
+                                visual.Source
+                            );
+
+                        DynamicBuffer<SubMeshGroup> subMeshGroups =
+                            EntityManager.GetBuffer<SubMeshGroup>(
+                                prefabRef.m_Prefab
+                            );
+
+                        for (
+                            int groupIndex = 0;
+                            groupIndex < meshGroups.Length;
+                            groupIndex++
+                        )
+                        {
+                            MeshGroup group =
+                                meshGroups[
+                                    groupIndex
+                                ];
+
+                            int subMeshGroupIndex =
+                                group.m_SubMeshGroup;
+
+                            if (
+                                subMeshGroupIndex < 0 ||
+                                subMeshGroupIndex >=
+                                    subMeshGroups.Length
+                            )
+                            {
+                                continue;
+                            }
+
+                            SubMeshGroup subMeshGroup =
+                                subMeshGroups[
+                                    subMeshGroupIndex
+                                ];
+
+                            if (
+                                sourceSubMeshIndex <
+                                    subMeshGroup.m_SubMeshRange.x ||
+                                sourceSubMeshIndex >=
+                                    subMeshGroup.m_SubMeshRange.y
+                            )
+                            {
+                                continue;
+                            }
+
+                            colorIndex =
+                                sourceMeshIndex +
+                                group.m_ColorOffset;
+
+                            break;
+                        }
                     }
+                }
+            }
+            catch
+            {
+                colorIndex =
+                    sourceMeshIndex;
+            }
 
-                    MaterialPropertyBlock block =
-                        new MaterialPropertyBlock();
+            if (
+                colorIndex < 0 ||
+                colorIndex >=
+                    colors.Length
+            )
+            {
+                return false;
+            }
 
-                    renderer.GetPropertyBlock(
-                        block
-                    );
+            meshColor =
+                colors[
+                    colorIndex
+                ];
 
-                    // A single MeshRenderer can carry both the exterior shader
-                    // and BH/SG_WinShader. Do not inspect only sharedMaterial[0]:
-                    // the property block is renderer-wide and unused properties
-                    // are harmless on materials that do not consume them.
-                    block.SetColor(
-                        "colossal_ColorMask0",
-                        channel0
-                    );
+            resolvedColorIndex =
+                colorIndex;
 
-                    block.SetColor(
-                        "colossal_ColorMask1",
-                        channel1
-                    );
+            return true;
+        }
 
-                    block.SetColor(
-                        "colossal_ColorMask2",
-                        channel2
-                    );
+        private bool ApplySourceBuildingColorMasks(
+            ConstructionVisual visual
+        )
+        {
+            if (
+                visual == null ||
+                visual.FacadeCutoffMeshes == null ||
+                visual.FacadeCutoffMeshes.Count == 0
+            )
+            {
+                return false;
+            }
 
-                    renderer.SetPropertyBlock(
-                        block
-                    );
+            int applied =
+                0;
+
+            int unavailable =
+                0;
+
+            for (
+                int i = 0;
+                i < visual.FacadeCutoffMeshes.Count;
+                i++
+            )
+            {
+                CutoffMeshVisual facade =
+                    visual.FacadeCutoffMeshes[i];
+
+                if (
+                    facade == null ||
+                    facade.Renderer == null
+                )
+                {
+                    continue;
                 }
 
+                MeshColor meshColor;
+                int resolvedColorIndex;
+
+                if (
+                    !TryGetMeshColorForSubMesh(
+                        visual,
+                        facade.SourceColorSubMeshIndex,
+                        facade.SourceColorMeshIndex,
+                        out meshColor,
+                        out resolvedColorIndex
+                    )
+                )
+                {
+                    unavailable++;
+
+                    // Keep the actual facade textures but without final tint
+                    // until MeshColorSystem has produced the instance colors.
+                    SetRendererColorMasks(
+                        facade.Renderer,
+                        UnityEngine.Color.white,
+                        UnityEngine.Color.white,
+                        UnityEngine.Color.white
+                    );
+
+                    continue;
+                }
+
+                // BatchDataSystem explicitly sends linear MeshColor channels
+                // to colossal_ColorMask0/1/2. Mirror that native path.
+                UnityEngine.Color channel0 =
+                    meshColor.m_ColorSet
+                        .m_Channel0;
+
+                UnityEngine.Color channel1 =
+                    meshColor.m_ColorSet
+                        .m_Channel1;
+
+                UnityEngine.Color channel2 =
+                    meshColor.m_ColorSet
+                        .m_Channel2;
+
+                SetRendererColorMasks(
+                    facade.Renderer,
+                    channel0,
+                    channel1,
+                    channel2
+                );
+
+                applied++;
+
                 ModLog.Checkpoint(
-                    "CUTOFF-COLOR source=" +
+                    "FACADE-COLOR mesh; source=" +
                     visual.Source.Index +
                     ":" +
                     visual.Source.Version +
-                    "; renderers=" +
-                    renderers.Length +
-                    "; channel0=" +
+                    "; subMesh=" +
+                    facade.SourceColorSubMeshIndex +
+                    "; meshIndex=" +
+                    facade.SourceColorMeshIndex +
+                    "; colorIndex=" +
+                    resolvedColorIndex +
+                    "; rawChannel0=" +
                     channel0 +
-                    "; channel1=" +
+                    "; rawChannel1=" +
                     channel1 +
-                    "; channel2=" +
+                    "; rawChannel2=" +
                     channel2
                 );
             }
-            catch (Exception ex)
-            {
-                ModLog.Info(
-                    "V1.43.37 BUILDING-COLOR apply failed; source=" +
-                    visual.Source.Index +
-                    ":" +
-                    visual.Source.Version +
-                    "; error=" +
-                    ex.GetType().Name +
-                    ": " +
-                    ex.Message
-                );
-            }
+
+            ModLog.Checkpoint(
+                "FACADE-COLOR apply; source=" +
+                visual.Source.Index +
+                ":" +
+                visual.Source.Version +
+                "; applied=" +
+                applied +
+                "; unavailable=" +
+                unavailable
+            );
+
+            return
+                applied > 0;
         }
 
         private void ProbeLoadedSurfaceVT(
@@ -17689,6 +19865,89 @@ namespace ConstructionAnimation.Systems
             );
         }
 
+        private static void ClipCutoffPolygonAboveHeight(
+            List<CutoffVertexData> input,
+            float minimumHeight,
+            List<CutoffVertexData> output
+        )
+        {
+            output.Clear();
+
+            if (
+                input == null ||
+                input.Count == 0
+            )
+            {
+                return;
+            }
+
+            CutoffVertexData previous =
+                input[
+                    input.Count -
+                    1
+                ];
+
+            bool previousInside =
+                previous.Position.y >=
+                minimumHeight -
+                0.00001f;
+
+            for (
+                int i = 0;
+                i < input.Count;
+                i++
+            )
+            {
+                CutoffVertexData current =
+                    input[i];
+
+                bool currentInside =
+                    current.Position.y >=
+                    minimumHeight -
+                    0.00001f;
+
+                if (
+                    currentInside
+                )
+                {
+                    if (
+                        !previousInside
+                    )
+                    {
+                        output.Add(
+                            IntersectCutoffVertex(
+                                previous,
+                                current,
+                                minimumHeight
+                            )
+                        );
+                    }
+
+                    output.Add(
+                        current
+                    );
+                }
+                else if (
+                    previousInside
+                )
+                {
+                    output.Add(
+                        IntersectCutoffVertex(
+                            previous,
+                            current,
+                            minimumHeight
+                        )
+                    );
+                }
+
+                previous =
+                    current;
+
+                previousInside =
+                    currentInside;
+            }
+        }
+
         private static int AddCutoffRuntimeVertex(
             CutoffMeshVisual cutoff,
             CutoffVertexData vertex
@@ -17852,7 +20111,8 @@ namespace ConstructionAnimation.Systems
 
         private static void RebuildCutoffMesh(
             CutoffMeshVisual cutoff,
-            float cutHeight
+            float cutHeight,
+            float minimumHeight = float.NegativeInfinity
         )
         {
             if (
@@ -17949,6 +20209,14 @@ namespace ConstructionAnimation.Systems
             List<CutoffVertexData> clipped =
                 cutoff.RuntimeClipped;
 
+            List<CutoffVertexData> lowerClipped =
+                cutoff.RuntimeClippedLower;
+
+            bool hasMinimumHeight =
+                !float.IsNegativeInfinity(
+                    minimumHeight
+                );
+
             List<int> polygonIndices =
                 cutoff.RuntimePolygonIndices;
 
@@ -18015,26 +20283,65 @@ namespace ConstructionAnimation.Systems
                     const float epsilon =
                         0.00001f;
 
-                    bool inside0 =
+                    float sourceY0 =
                         cutoff.SourceVertices[
                             index0
-                        ].y <=
-                        cutHeight +
-                        epsilon;
+                        ].y;
 
-                    bool inside1 =
+                    float sourceY1 =
                         cutoff.SourceVertices[
                             index1
-                        ].y <=
+                        ].y;
+
+                    float sourceY2 =
+                        cutoff.SourceVertices[
+                            index2
+                        ].y;
+
+                    bool upperInside0 =
+                        sourceY0 <=
                         cutHeight +
                         epsilon;
 
-                    bool inside2 =
-                        cutoff.SourceVertices[
-                            index2
-                        ].y <=
+                    bool upperInside1 =
+                        sourceY1 <=
                         cutHeight +
                         epsilon;
+
+                    bool upperInside2 =
+                        sourceY2 <=
+                        cutHeight +
+                        epsilon;
+
+                    bool lowerInside0 =
+                        !hasMinimumHeight ||
+                        sourceY0 >=
+                        minimumHeight -
+                        epsilon;
+
+                    bool lowerInside1 =
+                        !hasMinimumHeight ||
+                        sourceY1 >=
+                        minimumHeight -
+                        epsilon;
+
+                    bool lowerInside2 =
+                        !hasMinimumHeight ||
+                        sourceY2 >=
+                        minimumHeight -
+                        epsilon;
+
+                    bool inside0 =
+                        upperInside0 &&
+                        lowerInside0;
+
+                    bool inside1 =
+                        upperInside1 &&
+                        lowerInside1;
+
+                    bool inside2 =
+                        upperInside2 &&
+                        lowerInside2;
 
                     if (
                         inside0 &&
@@ -18083,9 +20390,17 @@ namespace ConstructionAnimation.Systems
                     }
 
                     if (
-                        !inside0 &&
-                        !inside1 &&
-                        !inside2
+                        (
+                            !upperInside0 &&
+                            !upperInside1 &&
+                            !upperInside2
+                        ) ||
+                        (
+                            hasMinimumHeight &&
+                            !lowerInside0 &&
+                            !lowerInside1 &&
+                            !lowerInside2
+                        )
                     )
                     {
                         continue;
@@ -18124,16 +20439,40 @@ namespace ConstructionAnimation.Systems
                         continue;
                     }
 
+                    List<CutoffVertexData> finalClipped =
+                        clipped;
+
+                    if (
+                        hasMinimumHeight
+                    )
+                    {
+                        ClipCutoffPolygonAboveHeight(
+                            clipped,
+                            minimumHeight,
+                            lowerClipped
+                        );
+
+                        finalClipped =
+                            lowerClipped;
+                    }
+
+                    if (
+                        finalClipped.Count < 3
+                    )
+                    {
+                        continue;
+                    }
+
                     polygonIndices.Clear();
 
                     for (
                         int i = 0;
-                        i < clipped.Count;
+                        i < finalClipped.Count;
                         i++
                     )
                     {
                         CutoffVertexData vertex =
-                            clipped[i];
+                            finalClipped[i];
 
                         int runtimeIndex =
                             vertex.SourceIndex >= 0
@@ -18404,88 +20743,78 @@ namespace ConstructionAnimation.Systems
             return result;
         }
 
-        private void CreateCutoffBuildingVisual(
-            ConstructionVisual visual,
-            Entity buildingPrefab
+        private bool TryGetOrBuildCutoffPrefabTemplate(
+            Entity buildingPrefab,
+            out CutoffPrefabTemplate template
         )
         {
+            template =
+                null;
+
             if (
-                visual == null ||
                 buildingPrefab == Entity.Null ||
                 !EntityManager.Exists(
                     buildingPrefab
                 )
             )
             {
-                return;
+                return false;
             }
 
-            GameObject root =
-                new GameObject(
-                    "ConstructionAnimation_CutoffBuilding_" +
-                    visual.Source.Index +
-                    "_" +
-                    visual.Source.Version
-                );
-
-            root.hideFlags =
-                HideFlags.DontSave;
-
-            visual.BuildingVisualRoot =
-                root;
-
-            visual.BuildingFoldRoot =
-                root;
-
-            visual.ConcreteStructureRoot =
-                null;
-
-            visual.RoofStructureRoot =
-                null;
-
-            Material cutoffMaterial =
-                CreateCutoffDisplayMaterial();
-
             if (
-                cutoffMaterial != null
+                m_CutoffPrefabTemplateCache.TryGetValue(
+                    buildingPrefab,
+                    out template
+                ) &&
+                template != null
             )
             {
-                visual.BuildingVisualMaterials.Add(
-                    cutoffMaterial
-                );
+                m_PerfCutoffTemplateHits++;
+
+                return true;
             }
 
-            float globalMinY =
-                float.MaxValue;
+            m_PerfCutoffTemplateMisses++;
 
-            float globalMaxY =
-                float.MinValue;
-
-            int totalVertices =
-                0;
-
-            int totalTriangles =
-                0;
-
-            int createdMeshes =
-                0;
+            template =
+                BuildCutoffPrefabTemplate(
+                    buildingPrefab
+                );
 
             if (
+                template == null
+            )
+            {
+                return false;
+            }
+
+            m_CutoffPrefabTemplateCache[
+                buildingPrefab
+            ] =
+                template;
+
+            return true;
+        }
+
+        private CutoffPrefabTemplate BuildCutoffPrefabTemplate(
+            Entity buildingPrefab
+        )
+        {
+            if (
+                buildingPrefab == Entity.Null ||
+                !EntityManager.Exists(
+                    buildingPrefab
+                ) ||
                 !EntityManager.HasBuffer<SubMesh>(
                     buildingPrefab
                 )
             )
             {
-                ModLog.Info(
-                    "CUTOFF-MESH skip; source=" +
-                    visual.Source.Index +
-                    ":" +
-                    visual.Source.Version +
-                    "; reason=no SubMesh buffer"
-                );
-
-                return;
+                return null;
             }
+
+            CutoffPrefabTemplate template =
+                new CutoffPrefabTemplate();
 
             DynamicBuffer<SubMesh> subMeshes =
                 EntityManager.GetBuffer<SubMesh>(
@@ -18499,7 +20828,9 @@ namespace ConstructionAnimation.Systems
             )
             {
                 SubMesh subMesh =
-                    subMeshes[subIndex];
+                    subMeshes[
+                        subIndex
+                    ];
 
                 Entity renderPrefabEntity =
                     subMesh.m_SubMesh;
@@ -18511,16 +20842,6 @@ namespace ConstructionAnimation.Systems
                     )
                 )
                 {
-                    ModLog.Info(
-                        "CUTOFF-MESH skip; source=" +
-                        visual.Source.Index +
-                        ":" +
-                        visual.Source.Version +
-                        "; sub=" +
-                        subIndex +
-                        "; reason=render prefab missing"
-                    );
-
                     continue;
                 }
 
@@ -18540,16 +20861,6 @@ namespace ConstructionAnimation.Systems
                         geometryAsset == null
                     )
                     {
-                        ModLog.Info(
-                            "CUTOFF-MESH skip; source=" +
-                            visual.Source.Index +
-                            ":" +
-                            visual.Source.Version +
-                            "; sub=" +
-                            subIndex +
-                            "; reason=no GeometryAsset"
-                        );
-
                         continue;
                     }
 
@@ -18558,11 +20869,15 @@ namespace ConstructionAnimation.Systems
                             true
                         );
 
-                    // V1.43.47.4.3.5 diagnostic: vanilla RenderPrefabRenderer iterates
-                    // every mesh returned by RenderPrefab.ObtainMeshes(), consuming the
-                    // material array sequentially across all mesh submeshes. Our cutoff
-                    // renderer currently uses only meshes[0]. Log the exact topology so
-                    // we can verify whether window geometry lives in a later mesh.
+                    if (
+                        meshes == null ||
+                        meshes.Length == 0
+                    )
+                    {
+                        continue;
+                    }
+
+                    // Layout diagnostics are useful once, on the template miss.
                     try
                     {
                         RenderPrefab diagnosticRenderPrefab =
@@ -18571,54 +20886,47 @@ namespace ConstructionAnimation.Systems
                         int diagnosticTotalSubMeshes =
                             0;
 
-                        if (meshes != null)
+                        for (
+                            int diagnosticMeshIndex = 0;
+                            diagnosticMeshIndex < meshes.Length;
+                            diagnosticMeshIndex++
+                        )
                         {
-                            for (
-                                int diagnosticMeshIndex = 0;
-                                diagnosticMeshIndex < meshes.Length;
-                                diagnosticMeshIndex++
+                            Mesh diagnosticMesh =
+                                meshes[
+                                    diagnosticMeshIndex
+                                ];
+
+                            if (
+                                diagnosticMesh == null
                             )
                             {
-                                Mesh diagnosticMesh =
-                                    meshes[diagnosticMeshIndex];
-
-                                if (diagnosticMesh == null)
-                                {
-                                    ModLog.Checkpoint(
-                                        "CUTOFF-MESH-LAYOUT; renderPrefab=" +
-                                        renderPrefabEntity.Index +
-                                        ":" +
-                                        renderPrefabEntity.Version +
-                                        "; mesh=" +
-                                        diagnosticMeshIndex +
-                                        "; null=True"
-                                    );
-
-                                    continue;
-                                }
-
-                                diagnosticTotalSubMeshes +=
-                                    diagnosticMesh.subMeshCount;
-
-                                ModLog.Checkpoint(
-                                    "CUTOFF-MESH-LAYOUT; renderPrefab=" +
-                                    renderPrefabEntity.Index +
-                                    ":" +
-                                    renderPrefabEntity.Version +
-                                    "; mesh=" +
-                                    diagnosticMeshIndex +
-                                    "; name=" +
-                                    diagnosticMesh.name +
-                                    "; vertices=" +
-                                    diagnosticMesh.vertexCount +
-                                    "; subMeshes=" +
-                                    diagnosticMesh.subMeshCount +
-                                    "; triangles=" +
-                                    (diagnosticMesh.triangles != null
-                                        ? diagnosticMesh.triangles.Length / 3
-                                        : 0)
-                                );
+                                continue;
                             }
+
+                            diagnosticTotalSubMeshes +=
+                                diagnosticMesh.subMeshCount;
+
+                            ModLog.Checkpoint(
+                                "CUTOFF-MESH-LAYOUT; renderPrefab=" +
+                                renderPrefabEntity.Index +
+                                ":" +
+                                renderPrefabEntity.Version +
+                                "; mesh=" +
+                                diagnosticMeshIndex +
+                                "; name=" +
+                                diagnosticMesh.name +
+                                "; vertices=" +
+                                diagnosticMesh.vertexCount +
+                                "; subMeshes=" +
+                                diagnosticMesh.subMeshCount +
+                                "; triangles=" +
+                                (
+                                    diagnosticMesh.triangles != null
+                                        ? diagnosticMesh.triangles.Length / 3
+                                        : 0
+                                )
+                            );
                         }
 
                         ModLog.Checkpoint(
@@ -18627,47 +20935,20 @@ namespace ConstructionAnimation.Systems
                             ":" +
                             renderPrefabEntity.Version +
                             "; meshCount=" +
-                            (meshes != null ? meshes.Length : 0) +
+                            meshes.Length +
                             "; totalSubMeshes=" +
                             diagnosticTotalSubMeshes +
                             "; materialCount=" +
-                            (diagnosticRenderPrefab != null
-                                ? diagnosticRenderPrefab.materialCount
-                                : -1) +
-                            "; currentRendererUsesOnlyMesh0=True"
+                            (
+                                diagnosticRenderPrefab != null
+                                    ? diagnosticRenderPrefab.materialCount
+                                    : -1
+                            ) +
+                            "; templateCached=True"
                         );
                     }
-                    catch (Exception diagnosticEx)
+                    catch
                     {
-                        ModLog.Info(
-                            "V1.43.47.4.3.5 mesh-layout diagnostic failed; renderPrefab=" +
-                            renderPrefabEntity.Index +
-                            ":" +
-                            renderPrefabEntity.Version +
-                            "; error=" +
-                            diagnosticEx.GetType().Name +
-                            ": " +
-                            diagnosticEx.Message
-                        );
-                    }
-
-                    if (
-                        meshes == null ||
-                        meshes.Length == 0 ||
-                        meshes[0] == null
-                    )
-                    {
-                        ModLog.Info(
-                            "CUTOFF-MESH skip; source=" +
-                            visual.Source.Index +
-                            ":" +
-                            visual.Source.Version +
-                            "; sub=" +
-                            subIndex +
-                            "; reason=no readable mesh"
-                        );
-
-                        continue;
                     }
 
                     int materialStartIndex =
@@ -18679,36 +20960,40 @@ namespace ConstructionAnimation.Systems
                         meshIndex++
                     )
                     {
+                        Mesh sourceMesh =
+                            meshes[
+                                meshIndex
+                            ];
+
                         if (
-                            meshes[meshIndex] == null
+                            sourceMesh == null
                         )
                         {
                             continue;
                         }
-
-                        int sourceSubMeshCountForOffset =
-                            Mathf.Max(
-                                1,
-                                meshes[meshIndex].subMeshCount
-                            );
-
-                        int currentMaterialStartIndex =
-                            materialStartIndex;
-
-                        materialStartIndex +=
-                            sourceSubMeshCountForOffset;
-
-                            Mesh sourceMesh =
-                                meshes[meshIndex];
-
-                        Vector3[] sourceVertices =
-                            sourceMesh.vertices;
 
                         int sourceSubMeshCount =
                             Mathf.Max(
                                 1,
                                 sourceMesh.subMeshCount
                             );
+
+                        int currentMaterialStartIndex =
+                            materialStartIndex;
+
+                        materialStartIndex +=
+                            sourceSubMeshCount;
+
+                        Vector3[] sourceVertices =
+                            sourceMesh.vertices;
+
+                        if (
+                            sourceVertices == null ||
+                            sourceVertices.Length < 3
+                        )
+                        {
+                            continue;
+                        }
 
                         int[][] sourceSubMeshTriangles =
                             new int[
@@ -18745,21 +21030,9 @@ namespace ConstructionAnimation.Systems
                         }
 
                         if (
-                            sourceVertices == null ||
-                            sourceVertices.Length < 3 ||
                             sourceTriangleCount <= 0
                         )
                         {
-                            ModLog.Info(
-                                "CUTOFF-MESH skip; source=" +
-                                visual.Source.Index +
-                                ":" +
-                                visual.Source.Version +
-                                "; sub=" +
-                                subIndex +
-                                "; reason=empty geometry"
-                            );
-
                             continue;
                         }
 
@@ -18839,11 +21112,6 @@ namespace ConstructionAnimation.Systems
                                     uvChannel
                                 ] =
                                     new Vector4[0];
-
-                                hasUVChannels[
-                                    uvChannel
-                                ] =
-                                    false;
                             }
                         }
 
@@ -18974,215 +21242,92 @@ namespace ConstructionAnimation.Systems
                             continue;
                         }
 
-                        GameObject child =
-                            new GameObject(
-                                    "CutoffMesh_" +
-                                    subIndex +
-                                    "_" +
-                                    meshIndex
-                            );
+                        CutoffPrefabMeshTemplate meshTemplate =
+                            new CutoffPrefabMeshTemplate();
 
-                        child.hideFlags =
-                            HideFlags.DontSave;
+                        meshTemplate.RenderPrefabEntity =
+                            renderPrefabEntity;
 
-                        child.transform.SetParent(
-                            root.transform,
-                            false
-                        );
+                        meshTemplate.SourceSubMeshIndex =
+                            subIndex;
 
-                        Mesh runtimeMesh =
-                            new Mesh();
+                        meshTemplate.SourceMeshIndex =
+                            meshIndex;
 
-                        runtimeMesh.name =
-                                "ConstructionAnimation_CutoffMesh_" +
-                                visual.Source.Index +
-                                "_" +
-                                subIndex +
-                                "_" +
-                                meshIndex;
+                        meshTemplate.MaterialStartIndex =
+                            currentMaterialStartIndex;
 
-                        runtimeMesh.indexFormat =
-                            UnityEngine.Rendering.IndexFormat.UInt32;
+                        meshTemplate.SourceSubMeshCount =
+                            sourceSubMeshCount;
 
-                        MeshFilter filter =
-                            child.AddComponent<MeshFilter>();
+                        meshTemplate.SourcePrefabName =
+                            managedPrefab.GetType().Name;
 
-                        filter.sharedMesh =
-                            runtimeMesh;
-
-                        MeshRenderer renderer =
-                            child.AddComponent<MeshRenderer>();
-
-                        Material[] sourceMaterials =
-                                TryCreateFoldedMaterialsFromSurfaceAssets(
-                                    visual,
-                                    managedPrefab,
-                                    renderPrefabEntity,
-                                    sourceSubMeshCount,
-                                    currentMaterialStartIndex
-                                );
-
-                        if (
-                            sourceMaterials == null ||
-                            sourceMaterials.Length == 0
-                        )
-                        {
-                            sourceMaterials =
-                                new Material[
-                                    sourceSubMeshCount
-                                ];
-
-                            for (
-                                int materialIndex = 0;
-                                materialIndex < sourceMaterials.Length;
-                                materialIndex++
-                            )
-                            {
-                                sourceMaterials[
-                                    materialIndex
-                                ] =
-                                    cutoffMaterial;
-                            }
-                        }
-
-                        renderer.sharedMaterials =
-                            sourceMaterials;
-
-                        ConfigureStructureRenderer(
-                            renderer
-                        );
-
-                        CutoffMeshVisual cutoff =
-                            new CutoffMeshVisual();
-
-                        cutoff.Root =
-                            child;
-
-                        cutoff.RuntimeMesh =
-                            runtimeMesh;
-
-                        cutoff.SourceVertices =
+                        meshTemplate.SourceVertices =
                             transformedVertices;
 
-                        cutoff.SourceNormals =
+                        meshTemplate.SourceNormals =
                             transformedNormals;
 
-                        cutoff.SourceTangents =
+                        meshTemplate.SourceTangents =
                             transformedTangents;
 
-                        cutoff.SourceUVChannels =
+                        meshTemplate.SourceUVChannels =
                             sourceUVChannels;
 
-                        for (
-                            int uvChannel = 0;
-                            uvChannel < 8;
-                            uvChannel++
-                        )
-                        {
-                            cutoff.HasUVChannels[
-                                uvChannel
-                            ] =
-                                hasUVChannels[
-                                    uvChannel
-                                ];
-                        }
+                        meshTemplate.HasUVChannels =
+                            hasUVChannels;
 
-                        cutoff.SourceColors =
+                        meshTemplate.SourceColors =
                             hasColors
                                 ? sourceColors
                                 : new UnityEngine.Color[0];
 
-                        cutoff.SourceSubMeshTriangles =
+                        meshTemplate.SourceSubMeshTriangles =
                             sourceSubMeshTriangles;
 
-                        cutoff.RuntimeSubMeshTriangles =
-                            new List<int>[
-                                sourceSubMeshCount
-                            ];
-
-                        for (
-                            int materialIndex = 0;
-                            materialIndex < sourceSubMeshCount;
-                            materialIndex++
-                        )
-                        {
-                            cutoff.RuntimeSubMeshTriangles[
-                                materialIndex
-                            ] =
-                                new List<int>();
-                        }
-
-                        cutoff.HasNormals =
+                        meshTemplate.HasNormals =
                             hasNormals;
 
-                        cutoff.HasTangents =
+                        meshTemplate.HasTangents =
                             hasTangents;
 
-                        cutoff.HasColors =
+                        meshTemplate.HasColors =
                             hasColors;
 
-                        cutoff.MinY =
+                        meshTemplate.MinY =
                             localMinY;
 
-                        cutoff.MaxY =
+                        meshTemplate.MaxY =
                             localMaxY;
 
-                        cutoff.SourceSubMeshIndex =
-                            subIndex;
+                        meshTemplate.SourceVertexCount =
+                            sourceVertices.Length;
 
-                        cutoff.SourcePrefabName =
-                            managedPrefab.GetType().Name;
+                        meshTemplate.SourceTriangleCount =
+                            sourceTriangleCount;
 
-                        visual.CutoffMeshes.Add(
-                            cutoff
+                        template.Meshes.Add(
+                            meshTemplate
                         );
 
-                        visual.BuildingVisualMeshes.Add(
-                            runtimeMesh
-                        );
-
-                        globalMinY =
+                        template.MinY =
                             Mathf.Min(
-                                globalMinY,
+                                template.MinY,
                                 localMinY
                             );
 
-                        globalMaxY =
+                        template.MaxY =
                             Mathf.Max(
-                                globalMaxY,
+                                template.MaxY,
                                 localMaxY
                             );
 
-                        totalVertices +=
+                        template.TotalVertices +=
                             sourceVertices.Length;
 
-                        totalTriangles +=
+                        template.TotalTriangles +=
                             sourceTriangleCount;
-
-                        createdMeshes++;
-
-                        ModLog.Info(
-                            "CUTOFF-MESH source=" +
-                            visual.Source.Index +
-                            ":" +
-                            visual.Source.Version +
-                            "; sub=" +
-                            subIndex +
-                                "; mesh=" +
-                                meshIndex +
-                                "; prefab=" +
-                                managedPrefab.GetType().Name +
-                            "; vertices=" +
-                            sourceVertices.Length +
-                            "; triangles=" +
-                            sourceTriangleCount +
-                            "; materials=" +
-                            sourceSubMeshCount +
-                            "; minY=" +
-                            localMinY.ToString("0.00") +
-                            "; maxY=" +
-                            localMaxY.ToString("0.00")
-                        );
                     }
                 }
                 catch (
@@ -19190,10 +21335,10 @@ namespace ConstructionAnimation.Systems
                 )
                 {
                     ModLog.Info(
-                        "CUTOFF-MESH skip; source=" +
-                        visual.Source.Index +
+                        "CUTOFF-TEMPLATE skip; prefab=" +
+                        buildingPrefab.Index +
                         ":" +
-                        visual.Source.Version +
+                        buildingPrefab.Version +
                         "; sub=" +
                         subIndex +
                         "; reason=" +
@@ -19205,22 +21350,74 @@ namespace ConstructionAnimation.Systems
             }
 
             if (
-                createdMeshes > 0
+                template.Meshes.Count == 0
             )
             {
-                ApplySourceMeshColorToFoldedBuilding(
-                    visual
+                return null;
+            }
+
+            return template;
+        }
+
+        private void CreateCutoffBuildingVisual(
+            ConstructionVisual visual,
+            Entity buildingPrefab
+        )
+        {
+            if (
+                visual == null ||
+                buildingPrefab == Entity.Null ||
+                !EntityManager.Exists(
+                    buildingPrefab
+                )
+            )
+            {
+                return;
+            }
+
+            GameObject root =
+                new GameObject(
+                    "ConstructionAnimation_CutoffBuilding_" +
+                    visual.Source.Index +
+                    "_" +
+                    visual.Source.Version
                 );
 
-                ApplyBuildingStateToFoldedBuilding(
-                    visual
+            root.hideFlags =
+                HideFlags.DontSave;
+
+            visual.BuildingVisualRoot =
+                root;
+
+            visual.BuildingFoldRoot =
+                root;
+
+            visual.ConcreteStructureRoot =
+                null;
+
+            visual.RoofStructureRoot =
+                null;
+
+            Material cutoffMaterial =
+                CreateCutoffDisplayMaterial();
+
+            if (
+                cutoffMaterial != null
+            )
+            {
+                visual.BuildingVisualMaterials.Add(
+                    cutoffMaterial
                 );
             }
 
+            CutoffPrefabTemplate template;
+
             if (
-                createdMeshes <= 0 ||
-                globalMinY == float.MaxValue ||
-                globalMaxY == float.MinValue
+                !TryGetOrBuildCutoffPrefabTemplate(
+                    buildingPrefab,
+                    out template
+                ) ||
+                template == null
             )
             {
                 visual.CutoffLocalMinY =
@@ -19235,29 +21432,425 @@ namespace ConstructionAnimation.Systems
                 visual.HasCutoffHeight =
                     false;
 
-                ModLog.Info(
-                    "CUTOFF-CREATE complete source=" +
-                    visual.Source.Index +
-                    ":" +
-                    visual.Source.Version +
-                    "; meshes=0; status=no usable geometry"
+                return;
+            }
+
+            int createdMeshes =
+                0;
+
+            for (
+                int templateIndex = 0;
+                templateIndex < template.Meshes.Count;
+                templateIndex++
+            )
+            {
+                CutoffPrefabMeshTemplate meshTemplate =
+                    template.Meshes[
+                        templateIndex
+                    ];
+
+                if (
+                    meshTemplate == null
+                )
+                {
+                    continue;
+                }
+
+                GameObject child =
+                    new GameObject(
+                        "CutoffMesh_" +
+                        meshTemplate.SourceSubMeshIndex +
+                        "_" +
+                        meshTemplate.SourceMeshIndex
+                    );
+
+                child.hideFlags =
+                    HideFlags.DontSave;
+
+                child.transform.SetParent(
+                    root.transform,
+                    false
                 );
+
+                Mesh runtimeMesh =
+                    new Mesh();
+
+                runtimeMesh.name =
+                    "ConstructionAnimation_CutoffMesh_" +
+                    visual.Source.Index +
+                    "_" +
+                    meshTemplate.SourceSubMeshIndex +
+                    "_" +
+                    meshTemplate.SourceMeshIndex;
+
+                runtimeMesh.indexFormat =
+                    UnityEngine.Rendering.IndexFormat.UInt32;
+
+                MeshFilter filter =
+                    child.AddComponent<MeshFilter>();
+
+                filter.sharedMesh =
+                    runtimeMesh;
+
+                MeshRenderer renderer =
+                    child.AddComponent<MeshRenderer>();
+
+                Material[] sourceMaterials =
+                    null;
+
+                try
+                {
+                    PrefabBase managedPrefab =
+                        m_PrefabSystem.GetPrefab<PrefabBase>(
+                            meshTemplate.RenderPrefabEntity
+                        );
+
+                    sourceMaterials =
+                        TryCreateFoldedMaterialsFromSurfaceAssets(
+                            visual,
+                            managedPrefab,
+                            meshTemplate.RenderPrefabEntity,
+                            meshTemplate.SourceSubMeshCount,
+                            meshTemplate.MaterialStartIndex
+                        );
+                }
+                catch
+                {
+                }
+
+                if (
+                    sourceMaterials == null ||
+                    sourceMaterials.Length == 0
+                )
+                {
+                    sourceMaterials =
+                        new Material[
+                            meshTemplate.SourceSubMeshCount
+                        ];
+
+                    for (
+                        int materialIndex = 0;
+                        materialIndex < sourceMaterials.Length;
+                        materialIndex++
+                    )
+                    {
+                        sourceMaterials[
+                            materialIndex
+                        ] =
+                            cutoffMaterial;
+                    }
+                }
+
+                // The unfinished building keeps the real facade texture,
+                // normals, windows and VT data. Only the instance color masks
+                // are neutralised, so construction looks like the same material
+                // before its final palette/tint is applied.
+                renderer.sharedMaterials =
+                    sourceMaterials;
+
+                ConfigureStructureRenderer(
+                    renderer
+                );
+
+                CutoffMeshVisual cutoff =
+                    new CutoffMeshVisual();
+
+                cutoff.Root =
+                    child;
+
+                cutoff.RuntimeMesh =
+                    runtimeMesh;
+
+                cutoff.Renderer =
+                    renderer;
+
+                cutoff.SourceColorSubMeshIndex =
+                    meshTemplate.SourceSubMeshIndex;
+
+                cutoff.SourceColorMeshIndex =
+                    meshTemplate.SourceMeshIndex;
+
+                // Immutable source arrays are safe to share between instances.
+                // RebuildCutoffMesh only writes runtime buffers/RuntimeMesh.
+                cutoff.SourceVertices =
+                    meshTemplate.SourceVertices;
+
+                cutoff.SourceNormals =
+                    meshTemplate.SourceNormals;
+
+                cutoff.SourceTangents =
+                    meshTemplate.SourceTangents;
+
+                cutoff.SourceUVChannels =
+                    meshTemplate.SourceUVChannels;
+
+                for (
+                    int uvChannel = 0;
+                    uvChannel < 8;
+                    uvChannel++
+                )
+                {
+                    cutoff.HasUVChannels[
+                        uvChannel
+                    ] =
+                        meshTemplate.HasUVChannels[
+                            uvChannel
+                        ];
+                }
+
+                cutoff.SourceColors =
+                    meshTemplate.SourceColors;
+
+                cutoff.SourceSubMeshTriangles =
+                    meshTemplate.SourceSubMeshTriangles;
+
+                cutoff.RuntimeSubMeshTriangles =
+                    new List<int>[
+                        meshTemplate.SourceSubMeshCount
+                    ];
+
+                for (
+                    int materialIndex = 0;
+                    materialIndex < meshTemplate.SourceSubMeshCount;
+                    materialIndex++
+                )
+                {
+                    cutoff.RuntimeSubMeshTriangles[
+                        materialIndex
+                    ] =
+                        new List<int>();
+                }
+
+                cutoff.HasNormals =
+                    meshTemplate.HasNormals;
+
+                cutoff.HasTangents =
+                    meshTemplate.HasTangents;
+
+                cutoff.HasColors =
+                    meshTemplate.HasColors;
+
+                cutoff.MinY =
+                    meshTemplate.MinY;
+
+                cutoff.MaxY =
+                    meshTemplate.MaxY;
+
+                cutoff.SourceSubMeshIndex =
+                    meshTemplate.SourceSubMeshIndex;
+
+                cutoff.SourcePrefabName =
+                    meshTemplate.SourcePrefabName;
+
+                visual.CutoffMeshes.Add(
+                    cutoff
+                );
+
+                visual.BuildingVisualMeshes.Add(
+                    runtimeMesh
+                );
+
+                GameObject facadeChild =
+                    new GameObject(
+                        "FacadeMesh_" +
+                        meshTemplate.SourceSubMeshIndex +
+                        "_" +
+                        meshTemplate.SourceMeshIndex
+                    );
+
+                facadeChild.hideFlags =
+                    HideFlags.DontSave;
+
+                facadeChild.transform.SetParent(
+                    root.transform,
+                    false
+                );
+
+                Mesh facadeRuntimeMesh =
+                    new Mesh();
+
+                facadeRuntimeMesh.name =
+                    "ConstructionAnimation_FacadeMesh_" +
+                    visual.Source.Index +
+                    "_" +
+                    meshTemplate.SourceSubMeshIndex +
+                    "_" +
+                    meshTemplate.SourceMeshIndex;
+
+                facadeRuntimeMesh.indexFormat =
+                    UnityEngine.Rendering.IndexFormat.UInt32;
+
+                MeshFilter facadeFilter =
+                    facadeChild.AddComponent<MeshFilter>();
+
+                facadeFilter.sharedMesh =
+                    facadeRuntimeMesh;
+
+                MeshRenderer facadeRenderer =
+                    facadeChild.AddComponent<MeshRenderer>();
+
+                facadeRenderer.sharedMaterials =
+                    sourceMaterials;
+
+                ConfigureStructureRenderer(
+                    facadeRenderer
+                );
+
+                CutoffMeshVisual facadeCutoff =
+                    new CutoffMeshVisual();
+
+                facadeCutoff.Root =
+                    facadeChild;
+
+                facadeCutoff.RuntimeMesh =
+                    facadeRuntimeMesh;
+
+                facadeCutoff.Renderer =
+                    facadeRenderer;
+
+                facadeCutoff.SourceColorSubMeshIndex =
+                    meshTemplate.SourceSubMeshIndex;
+
+                facadeCutoff.SourceColorMeshIndex =
+                    meshTemplate.SourceMeshIndex;
+
+                facadeCutoff.SourceVertices =
+                    meshTemplate.SourceVertices;
+
+                facadeCutoff.SourceNormals =
+                    meshTemplate.SourceNormals;
+
+                facadeCutoff.SourceTangents =
+                    meshTemplate.SourceTangents;
+
+                facadeCutoff.SourceUVChannels =
+                    meshTemplate.SourceUVChannels;
+
+                for (
+                    int uvChannel = 0;
+                    uvChannel < 8;
+                    uvChannel++
+                )
+                {
+                    facadeCutoff.HasUVChannels[
+                        uvChannel
+                    ] =
+                        meshTemplate.HasUVChannels[
+                            uvChannel
+                        ];
+                }
+
+                facadeCutoff.SourceColors =
+                    meshTemplate.SourceColors;
+
+                facadeCutoff.SourceSubMeshTriangles =
+                    meshTemplate.SourceSubMeshTriangles;
+
+                facadeCutoff.RuntimeSubMeshTriangles =
+                    new List<int>[
+                        meshTemplate.SourceSubMeshCount
+                    ];
+
+                for (
+                    int materialIndex = 0;
+                    materialIndex < meshTemplate.SourceSubMeshCount;
+                    materialIndex++
+                )
+                {
+                    facadeCutoff.RuntimeSubMeshTriangles[
+                        materialIndex
+                    ] =
+                        new List<int>();
+                }
+
+                facadeCutoff.HasNormals =
+                    meshTemplate.HasNormals;
+
+                facadeCutoff.HasTangents =
+                    meshTemplate.HasTangents;
+
+                facadeCutoff.HasColors =
+                    meshTemplate.HasColors;
+
+                facadeCutoff.MinY =
+                    meshTemplate.MinY;
+
+                facadeCutoff.MaxY =
+                    meshTemplate.MaxY;
+
+                facadeCutoff.SourceSubMeshIndex =
+                    meshTemplate.SourceSubMeshIndex;
+
+                facadeCutoff.SourcePrefabName =
+                    meshTemplate.SourcePrefabName;
+
+                visual.FacadeCutoffMeshes.Add(
+                    facadeCutoff
+                );
+
+                visual.BuildingVisualMeshes.Add(
+                    facadeRuntimeMesh
+                );
+
+                createdMeshes++;
+            }
+
+            if (
+                createdMeshes > 0
+            )
+            {
+                ApplyNeutralBuildingColorMasks(
+                    visual
+                );
+
+                ApplySourceBuildingColorMasks(
+                    visual
+                );
+
+                ApplyBuildingStateToFoldedBuilding(
+                    visual
+                );
+            }
+
+            if (
+                createdMeshes <= 0 ||
+                template.MinY == float.MaxValue ||
+                template.MaxY == float.MinValue
+            )
+            {
+                visual.CutoffLocalMinY =
+                    0f;
+
+                visual.CutoffLocalMaxY =
+                    Mathf.Max(
+                        0.1f,
+                        visual.BuildingHeight
+                    );
+
+                visual.HasCutoffHeight =
+                    false;
 
                 return;
             }
 
             visual.CutoffLocalMinY =
-                globalMinY;
+                template.MinY;
 
             visual.CutoffLocalMaxY =
                 Mathf.Max(
-                    globalMinY +
+                    template.MinY +
                     0.1f,
-                    globalMaxY
+                    template.MaxY
                 );
 
             visual.BuildingVisualBaseY =
-                globalMinY;
+                template.MinY;
+
+            visual.FacadeCompletedFloorCount =
+                -1;
+
+            visual.FacadeRevealHeight =
+                visual.CutoffLocalMinY;
 
             for (
                 int i = 0;
@@ -19267,7 +21860,22 @@ namespace ConstructionAnimation.Systems
             {
                 RebuildCutoffMesh(
                     visual.CutoffMeshes[i],
-                    visual.CutoffLocalMinY
+                    visual.CutoffLocalMinY,
+                    visual.CutoffLocalMinY +
+                    0.001f
+                );
+            }
+
+            for (
+                int i = 0;
+                i < visual.FacadeCutoffMeshes.Count;
+                i++
+            )
+            {
+                RebuildCutoffMesh(
+                    visual.FacadeCutoffMeshes[i],
+                    visual.CutoffLocalMinY -
+                    0.001f
                 );
             }
 
@@ -19288,27 +21896,10 @@ namespace ConstructionAnimation.Systems
                 "; renderers=" +
                 createdMeshes +
                 "; sourceVertices=" +
-                totalVertices +
+                template.TotalVertices +
                 "; sourceTriangles=" +
-                totalTriangles +
-                "; note=one renderer per ECS render submesh; camera-stutter diagnostic"
-            );
-
-            ModLog.Info(
-                "CUTOFF-CREATE complete source=" +
-                visual.Source.Index +
-                ":" +
-                visual.Source.Version +
-                "; meshes=" +
-                createdMeshes +
-                "; vertices=" +
-                totalVertices +
-                "; triangles=" +
-                totalTriangles +
-                "; minY=" +
-                visual.CutoffLocalMinY.ToString("0.00") +
-                "; maxY=" +
-                visual.CutoffLocalMaxY.ToString("0.00")
+                template.TotalTriangles +
+                "; templateCached=True"
             );
         }
 
@@ -19372,6 +21963,334 @@ namespace ConstructionAnimation.Systems
 
         }
 
+        private static int GetCompletedFacadeFloorCount(
+            ConstructionVisual visual,
+            float visualProgress
+        )
+        {
+            if (
+                visual == null ||
+                visual.FloorBoundaries == null ||
+                visual.FloorBoundaries.Count < 2
+            )
+            {
+                return 0;
+            }
+
+            float visibleHeight =
+                Mathf.Max(
+                    0f,
+                    visual.BuildingHeight
+                ) *
+                Mathf.Clamp01(
+                    visualProgress
+                );
+
+            int floorCount =
+                visual.FloorBoundaries.Count -
+                1;
+
+            int low =
+                1;
+
+            int high =
+                floorCount;
+
+            int completed =
+                0;
+
+            while (
+                low <= high
+            )
+            {
+                int mid =
+                    (low + high) >> 1;
+
+                if (
+                    visual.FloorBoundaries[
+                        mid
+                    ] <=
+                    visibleHeight +
+                    0.001f
+                )
+                {
+                    completed =
+                        mid;
+
+                    low =
+                        mid +
+                        1;
+                }
+                else
+                {
+                    high =
+                        mid -
+                        1;
+                }
+            }
+
+            return
+                Mathf.Clamp(
+                    completed,
+                    0,
+                    floorCount
+                );
+        }
+
+        private static int GetFacadePaintStartFloor(
+            int floorCount
+        )
+        {
+            if (
+                floorCount <= 0
+            )
+            {
+                return 0;
+            }
+
+            if (
+                floorCount <= 3
+            )
+            {
+                return
+                    Mathf.Min(
+                        floorCount,
+                        2
+                    );
+            }
+
+            if (
+                floorCount <= 7
+            )
+            {
+                return
+                    Mathf.Clamp(
+                        Mathf.CeilToInt(
+                            floorCount *
+                            0.30f
+                        ),
+                        2,
+                        floorCount
+                    );
+            }
+
+            return
+                Mathf.Clamp(
+                    Mathf.CeilToInt(
+                        floorCount *
+                        0.20f
+                    ),
+                    2,
+                    floorCount
+                );
+        }
+
+        private static int GetFacadePaintLagFloors(
+            int floorCount
+        )
+        {
+            if (
+                floorCount <= 0
+            )
+            {
+                return 0;
+            }
+
+            return
+                floorCount >= 8
+                    ? 2
+                    : 1;
+        }
+
+        private bool UpdateCompletedFacadeReveal(
+            ConstructionVisual visual,
+            float visualProgress
+        )
+        {
+            if (
+                visual == null ||
+                visual.FacadeCutoffMeshes == null ||
+                visual.FacadeCutoffMeshes.Count == 0
+            )
+            {
+                return false;
+            }
+
+            float progress =
+                Mathf.Clamp01(
+                    visualProgress
+                );
+
+            int completedFloorCount =
+                GetCompletedFacadeFloorCount(
+                    visual,
+                    progress
+                );
+
+            int floorCount =
+                visual.FloorBoundaries != null
+                    ? Mathf.Max(
+                        0,
+                        visual.FloorBoundaries.Count -
+                        1
+                    )
+                    : 0;
+
+            int paintStartFloor =
+                GetFacadePaintStartFloor(
+                    floorCount
+                );
+
+            int paintLagFloors =
+                GetFacadePaintLagFloors(
+                    floorCount
+                );
+
+            int paintableFloorCount =
+                0;
+
+            if (
+                progress >= 0.999f
+            )
+            {
+                paintableFloorCount =
+                    floorCount;
+            }
+            else if (
+                completedFloorCount >=
+                    paintStartFloor &&
+                paintStartFloor > 0
+            )
+            {
+                paintableFloorCount =
+                    Mathf.Clamp(
+                        completedFloorCount -
+                        paintLagFloors,
+                        0,
+                        floorCount
+                    );
+            }
+
+            float revealHeight =
+                visual.CutoffLocalMinY;
+
+            if (
+                progress >= 0.999f
+            )
+            {
+                revealHeight =
+                    visual.CutoffLocalMaxY;
+            }
+            else if (
+                paintableFloorCount > 0 &&
+                visual.FloorBoundaries != null &&
+                paintableFloorCount <
+                    visual.FloorBoundaries.Count
+            )
+            {
+                float completedLocalHeight =
+                    visual.FloorBoundaries[
+                        paintableFloorCount
+                    ];
+
+                float normalizedHeight =
+                    Mathf.Clamp01(
+                        completedLocalHeight /
+                        Mathf.Max(
+                            visual.BuildingHeight,
+                            0.01f
+                        )
+                    );
+
+                revealHeight =
+                    Mathf.Lerp(
+                        visual.CutoffLocalMinY,
+                        visual.CutoffLocalMaxY,
+                        normalizedHeight
+                    );
+            }
+
+            bool changed =
+                paintableFloorCount !=
+                    visual.FacadeCompletedFloorCount ||
+                Mathf.Abs(
+                    revealHeight -
+                    visual.FacadeRevealHeight
+                ) >
+                0.001f;
+
+            if (
+                !changed
+            )
+            {
+                return false;
+            }
+
+            float facadeMeshCutHeight =
+                paintableFloorCount > 0 ||
+                progress >= 0.999f
+                    ? revealHeight
+                    : visual.CutoffLocalMinY -
+                      0.001f;
+
+            for (
+                int i = 0;
+                i < visual.FacadeCutoffMeshes.Count;
+                i++
+            )
+            {
+                RebuildCutoffMesh(
+                    visual.FacadeCutoffMeshes[i],
+                    facadeMeshCutHeight
+                );
+            }
+
+            visual.FacadeCompletedFloorCount =
+                paintableFloorCount;
+
+            visual.FacadeRevealHeight =
+                revealHeight;
+
+            if (
+                paintableFloorCount > 0 ||
+                progress >= 0.999f
+            )
+            {
+                ApplySourceBuildingColorMasks(
+                    visual
+                );
+            }
+
+            ModLog.Checkpoint(
+                "FACADE floor-complete; source=" +
+                visual.Source.Index +
+                ":" +
+                visual.Source.Version +
+                "; structureFloors=" +
+                completedFloorCount +
+                "/" +
+                floorCount +
+                "; paintedFloors=" +
+                paintableFloorCount +
+                "/" +
+                floorCount +
+                "; paintStartFloor=" +
+                paintStartFloor +
+                "; paintLagFloors=" +
+                paintLagFloors +
+                "; revealHeight=" +
+                revealHeight.ToString(
+                    "0.00"
+                ) +
+                "; progress=" +
+                progress.ToString(
+                    "0.000"
+                )
+            );
+
+            return true;
+        }
+
         private void UpdateCutoffBuildingVisual(
             ConstructionVisual visual,
             Game.Objects.Transform sourceTransform,
@@ -19427,6 +22346,12 @@ namespace ConstructionAnimation.Systems
                     progress
                 );
 
+            bool facadeChanged =
+                UpdateCompletedFacadeReveal(
+                    visual,
+                    progress
+                );
+
             float heightDelta =
                 Mathf.Abs(
                     cutHeight -
@@ -19438,17 +22363,13 @@ namespace ConstructionAnimation.Systems
                 progress >= 0.999f;
 
             float adaptiveCutoffThreshold =
-                Mathf.Clamp(
-                    visual.BuildingHeight /
-                    Mathf.Max(
-                        CutoffTargetVerticalSteps,
-                        1f
-                    ),
-                    CutoffHeightUpdateMinimumThreshold,
-                    CutoffHeightUpdateMaximumThreshold
+                GetAdaptiveCutoffRebuildHeightThreshold(
+                    visual
                 );
 
             bool mustUpdate =
+                facadeChanged ||
+                visual.ForceCutoffResync ||
                 !visual.HasCutoffHeight ||
                 heightDelta >=
                     adaptiveCutoffThreshold ||
@@ -19461,6 +22382,8 @@ namespace ConstructionAnimation.Systems
                 !mustUpdate
             )
             {
+                m_PerfCutoffRebuildsSkipped++;
+
                 return;
             }
 
@@ -19472,7 +22395,13 @@ namespace ConstructionAnimation.Systems
             {
                 RebuildCutoffMesh(
                     visual.CutoffMeshes[i],
-                    cutHeight
+                    cutHeight,
+                    Mathf.Min(
+                        cutHeight +
+                        0.001f,
+                        visual.FacadeRevealHeight +
+                        0.001f
+                    )
                 );
             }
 
@@ -19481,6 +22410,9 @@ namespace ConstructionAnimation.Systems
 
             visual.HasCutoffHeight =
                 true;
+
+            visual.ForceCutoffResync =
+                false;
 
             if (
                 visual.LastCutoffLoggedProgress < 0f ||
@@ -20387,11 +23319,45 @@ namespace ConstructionAnimation.Systems
             float visualProgress
         )
         {
+            float previousCutoffHeight =
+                visual != null &&
+                visual.HasCutoffHeight
+                    ? visual.LastCutoffHeight
+                    : float.NaN;
+
+            long perfCutoffStart =
+                PerfTimestamp();
+
             UpdateCutoffBuildingVisual(
                 visual,
                 sourceTransform,
                 visualProgress
             );
+
+            PerfAdd(
+                ref m_PerfCutoffTicks,
+                ref m_PerfCutoffMaxTicks,
+                ref m_PerfCutoffCalls,
+                perfCutoffStart
+            );
+
+            if (
+                visual != null &&
+                visual.HasCutoffHeight &&
+                (
+                    float.IsNaN(
+                        previousCutoffHeight
+                    ) ||
+                    Mathf.Abs(
+                        visual.LastCutoffHeight -
+                        previousCutoffHeight
+                    ) >
+                    0.0001f
+                )
+            )
+            {
+                m_PerfCutoffRebuilds++;
+            }
         }
 
         private void DestroyFoldedBuildingVisual(
@@ -20467,6 +23433,13 @@ namespace ConstructionAnimation.Systems
             visual.BuildingVisualMaterials.Clear();
 
             visual.CutoffMeshes.Clear();
+            visual.FacadeCutoffMeshes.Clear();
+
+            visual.FacadeCompletedFloorCount =
+                -1;
+
+            visual.FacadeRevealHeight =
+                0f;
 
             visual.CutoffLocalMinY =
                 0f;
@@ -20479,6 +23452,12 @@ namespace ConstructionAnimation.Systems
 
             visual.HasCutoffHeight =
                 false;
+
+            visual.ForceCutoffResync =
+                false;
+
+            visual.CutoffDistanceBand =
+                -1;
 
             visual.LastCutoffLoggedProgress =
                 -1f;
@@ -20816,12 +23795,25 @@ namespace ConstructionAnimation.Systems
                 return;
             }
 
+            bool lodAllowsVisibility =
+                !active ||
+                visual.ScaffoldLodStep <= 1 ||
+                levelIndex %
+                    visual.ScaffoldLodStep == 0 ||
+                verticalScale <
+                    0.999f;
+
+            bool effectiveActive =
+                active &&
+                lodAllowsVisibility;
+
             if (
-                level.activeSelf != active
+                level.activeSelf !=
+                effectiveActive
             )
             {
                 level.SetActive(
-                    active
+                    effectiveActive
                 );
             }
 
@@ -20957,7 +23949,7 @@ namespace ConstructionAnimation.Systems
                 ":" +
                 visual.Source.Version +
                 "; duration=" +
-                ScaffoldDismantleDuration.ToString(
+                visual.DismantleDuration.ToString(
                     "0.0"
                 ) +
                 "s; animatedAssetHidden=True; completionHold=" +
@@ -21048,7 +24040,7 @@ namespace ConstructionAnimation.Systems
                     ":" +
                     visual.Source.Version +
                     "; duration=" +
-                    CompletedAssetHoldDuration.ToString(
+                    visual.CompletionHoldDuration.ToString(
                         "0.0"
                     ) +
                     "s; animatedAssetVisible=True"
@@ -21071,7 +24063,7 @@ namespace ConstructionAnimation.Systems
 
                 if (
                     completionHoldElapsed <
-                    CompletedAssetHoldDuration
+                    visual.CompletionHoldDuration
                 )
                 {
                     return false;
@@ -21178,7 +24170,7 @@ namespace ConstructionAnimation.Systems
                 Mathf.Clamp01(
                     elapsed /
                     Mathf.Max(
-                        ScaffoldDismantleDuration,
+                        visual.DismantleDuration,
                         0.01f
                     )
                 );
@@ -21420,6 +24412,97 @@ namespace ConstructionAnimation.Systems
             }
         }
 
+        private static void ApplyScaffoldLevelLod(
+            ConstructionVisual visual,
+            int lodStep
+        )
+        {
+            if (
+                visual == null ||
+                visual.ScaffoldLevels == null
+            )
+            {
+                return;
+            }
+
+            lodStep =
+                Mathf.Clamp(
+                    lodStep,
+                    1,
+                    3
+                );
+
+            visual.ScaffoldLodStep =
+                lodStep;
+
+            int levelCount =
+                visual.ScaffoldLevels.Count;
+
+            for (
+                int i = 0;
+                i < levelCount;
+                i++
+            )
+            {
+                GameObject level =
+                    visual.ScaffoldLevels[i];
+
+                if (
+                    level == null
+                )
+                {
+                    continue;
+                }
+
+                bool logicallyVisible;
+
+                if (
+                    visual.Dismantling
+                )
+                {
+                    int highestRemainingIndex =
+                        levelCount -
+                        visual.ScaffoldFullyDismantledCount -
+                        1;
+
+                    logicallyVisible =
+                        i <=
+                        highestRemainingIndex;
+                }
+                else
+                {
+                    logicallyVisible =
+                        i <
+                        visual.ScaffoldFullyRevealedCount ||
+                        i ==
+                        visual.ScaffoldPartialRevealIndex;
+                }
+
+                bool keepForLod =
+                    lodStep <= 1 ||
+                    i %
+                        lodStep == 0 ||
+                    i ==
+                        visual.ScaffoldPartialRevealIndex ||
+                    i ==
+                        visual.ScaffoldPartialDismantleIndex;
+
+                bool shouldBeActive =
+                    logicallyVisible &&
+                    keepForLod;
+
+                if (
+                    level.activeSelf !=
+                    shouldBeActive
+                )
+                {
+                    level.SetActive(
+                        shouldBeActive
+                    );
+                }
+            }
+        }
+
         private void UpdateScaffoldShadowLod(
             ConstructionVisual visual,
             float distance
@@ -21542,6 +24625,16 @@ namespace ConstructionAnimation.Systems
                     true;
 
                 if (
+                    visual.ScaffoldLodStep != 1
+                )
+                {
+                    ApplyScaffoldLevelLod(
+                        visual,
+                        1
+                    );
+                }
+
+                if (
                     !visual.ScaffoldRoot.activeSelf
                 )
                 {
@@ -21576,20 +24669,29 @@ namespace ConstructionAnimation.Systems
                 distance
             );
 
-            float footprintSize =
-                Mathf.Max(
-                    visual.BuildingSize.x,
-                    visual.BuildingSize.z
+            int desiredLodStep =
+                distance >=
+                ScaffoldFarLodDistance
+                    ? 3
+                    : distance >=
+                      ScaffoldMediumLodDistance
+                        ? 2
+                        : 1;
+
+            if (
+                desiredLodStep !=
+                visual.ScaffoldLodStep
+            )
+            {
+                ApplyScaffoldLevelLod(
+                    visual,
+                    desiredLodStep
                 );
+            }
 
             float cullDistance =
-                Mathf.Clamp(
-                    ScaffoldMinimumCullDistance +
-                    visual.BuildingHeight *
-                    ScaffoldCullDistancePerHeightMetre +
-                    footprintSize,
-                    ScaffoldMinimumCullDistance,
-                    ScaffoldMaximumCullDistance
+                GetAdaptiveScaffoldCullDistance(
+                    visual
                 );
 
             bool shouldBeVisible =
@@ -21713,6 +24815,41 @@ namespace ConstructionAnimation.Systems
             return m_RenderCamera;
         }
 
+        private static float DeterministicUnit(
+            int value,
+            int salt
+        )
+        {
+            unchecked
+            {
+                uint x =
+                    (uint)value;
+
+                x ^=
+                    (uint)salt *
+                    0x9E3779B9u;
+
+                x ^=
+                    x >> 16;
+
+                x *=
+                    0x7FEB352Du;
+
+                x ^=
+                    x >> 15;
+
+                x *=
+                    0x846CA68Bu;
+
+                x ^=
+                    x >> 16;
+
+                return
+                    (x & 0x00FFFFFFu) /
+                    16777215f;
+            }
+        }
+
         private static float Smooth01(
             float value
         )
@@ -21729,6 +24866,32 @@ namespace ConstructionAnimation.Systems
                     3f -
                     2f *
                     value
+                );
+        }
+
+        private static long GetScaffoldMeshCacheKey(
+            float levelHeight,
+            bool createBottomRing
+        )
+        {
+            int quantizedHeight =
+                Mathf.RoundToInt(
+                    Mathf.Max(
+                        levelHeight,
+                        0f
+                    ) *
+                    1000f
+                );
+
+            return
+                (
+                    (long)quantizedHeight <<
+                    1
+                ) |
+                (
+                    createBottomRing
+                        ? 1L
+                        : 0L
                 );
         }
 
@@ -21817,6 +24980,9 @@ namespace ConstructionAnimation.Systems
             visual.ScaffoldShadowsEnabled =
                 true;
 
+            Dictionary<long, Mesh> scaffoldMeshCache =
+                new Dictionary<long, Mesh>();
+
             int floorCount =
                 visual.FloorBoundaries.Count -
                 1;
@@ -21889,13 +25055,42 @@ namespace ConstructionAnimation.Systems
                     levelHeight
                 );
 
-                CreateScaffoldLevelDirect(
-                    visual,
-                    outline,
-                    levelRoot,
-                    levelHeight,
-                    levelIndex == 0
+                bool createBottomRing =
+                    levelIndex == 0;
+
+                long scaffoldMeshCacheKey =
+                    GetScaffoldMeshCacheKey(
+                        levelHeight,
+                        createBottomRing
+                    );
+
+                Mesh cachedScaffoldMesh = null;
+
+                scaffoldMeshCache.TryGetValue(
+                    scaffoldMeshCacheKey,
+                    out cachedScaffoldMesh
                 );
+
+                Mesh levelMesh =
+                    CreateScaffoldLevelDirect(
+                        visual,
+                        outline,
+                        levelRoot,
+                        levelHeight,
+                        createBottomRing,
+                        cachedScaffoldMesh
+                    );
+
+                if (
+                    levelMesh != null &&
+                    cachedScaffoldMesh == null
+                )
+                {
+                    scaffoldMeshCache[
+                        scaffoldMeshCacheKey
+                    ] =
+                        levelMesh;
+                }
 
                 levelRoot.SetActive(
                     false
@@ -21932,12 +25127,13 @@ namespace ConstructionAnimation.Systems
             );
         }
 
-        private void CreateScaffoldLevelDirect(
+        private Mesh CreateScaffoldLevelDirect(
             ConstructionVisual visual,
             List<Vector2> outline,
             GameObject levelRoot,
             float levelHeight,
-            bool createBottomRing
+            bool createBottomRing,
+            Mesh reusableMesh
         )
         {
             if (
@@ -21947,7 +25143,45 @@ namespace ConstructionAnimation.Systems
                 levelRoot == null
             )
             {
-                return;
+                return null;
+            }
+
+            if (
+                reusableMesh != null
+            )
+            {
+                MeshFilter reusedFilter =
+                    levelRoot.AddComponent<MeshFilter>();
+
+                reusedFilter.sharedMesh =
+                    reusableMesh;
+
+                MeshRenderer reusedRenderer =
+                    levelRoot.AddComponent<MeshRenderer>();
+
+                reusedRenderer.sharedMaterials =
+                    new Material[]
+                    {
+                        m_ScaffoldMetalMaterial,
+                        m_ScaffoldDeckMaterial
+                    };
+
+                ConfigureScaffoldRenderer(
+                    reusedRenderer
+                );
+
+                visual.ScaffoldRenderers.Add(
+                    reusedRenderer
+                );
+
+                visual.ScaffoldMeshes.Add(
+                    reusableMesh
+                );
+
+                m_PerfScaffoldMeshesReused++;
+
+                return
+                    reusableMesh;
             }
 
             ScaffoldGeometryBuffer buffer =
@@ -22140,7 +25374,7 @@ namespace ConstructionAnimation.Systems
                 buffer.Vertices.Count == 0
             )
             {
-                return;
+                return null;
             }
 
             Mesh mesh =
@@ -22220,6 +25454,8 @@ namespace ConstructionAnimation.Systems
                 renderer
             );
 
+            m_PerfScaffoldMeshesBuilt++;
+
             ModLog.Checkpoint(
                 "SCAFFOLD direct-mesh; source=" +
                 visual.Source.Index +
@@ -22231,6 +25467,9 @@ namespace ConstructionAnimation.Systems
                 mesh.subMeshCount +
                 "; tempChildren=0"
             );
+
+            return
+                mesh;
         }
 
         private static void AppendScaffoldBeam(
@@ -23364,12 +26603,17 @@ namespace ConstructionAnimation.Systems
                 );
             }
 
+            Entity vanillaCrane =
+                FindCraneSubObject(
+                    visual.Source
+                );
+
             if (
                 !visual.CraneEligible
             )
             {
-                ParkIneligibleVanillaCrane(
-                    visual,
+                ParkVanillaCraneEntity(
+                    vanillaCrane,
                     sourceTransform
                 );
 
@@ -23377,60 +26621,51 @@ namespace ConstructionAnimation.Systems
             }
 
             if (
-                !IsUsableCraneEntity(
-                    visual.CraneEntity
+                IsUsableCraneEntity(
+                    vanillaCrane
                 )
             )
             {
-                Entity foundCrane =
-                    FindCraneSubObject(
-                        visual.Source
-                    );
+                visual.VanillaCraneEntity =
+                    vanillaCrane;
 
                 if (
-                    IsUsableCraneEntity(
-                        foundCrane
-                    )
+                    !visual.CraneVerticalOffsetCaptured
                 )
                 {
-                    visual.CraneEntity =
-                        foundCrane;
+                    Game.Objects.Transform vanillaTransform =
+                        EntityManager.GetComponentData<Game.Objects.Transform>(
+                            vanillaCrane
+                        );
 
-                    visual.CraneUsingBackup =
-                        false;
+                    visual.CraneVerticalOffset =
+                        vanillaTransform.m_Position.y -
+                        sourceTransform.m_Position.y;
 
                     visual.CraneVerticalOffsetCaptured =
-                        false;
-
-                    visual.CranePositionLogged =
-                        false;
+                        true;
                 }
-                else if (
-                    IsUsableCraneEntity(
-                        visual.CraneBackupEntity
+
+                if (
+                    !IsUsableCraneEntity(
+                        visual.CraneEntity
                     )
                 )
                 {
-                    visual.CraneEntity =
-                        visual.CraneBackupEntity;
-
-                    visual.CraneUsingBackup =
-                        true;
-
-                    visual.CranePositionLogged =
-                        false;
-
-                    ModLog.Checkpoint(
-                        "CRANE backup activated; building=" +
-                        visual.Source.Index +
-                        ":" +
-                        visual.Source.Version +
-                        "; crane=" +
-                        visual.CraneBackupEntity.Index +
-                        ":" +
-                        visual.CraneBackupEntity.Version
+                    EnsureManagedCraneVisual(
+                        visual,
+                        vanillaCrane,
+                        sourceTransform
                     );
                 }
+
+                // Vanilla may recreate its construction crane. Keep that
+                // gameplay crane parked; the stripped clone below is the
+                // single visible crane.
+                ParkVanillaCraneEntity(
+                    vanillaCrane,
+                    sourceTransform
+                );
             }
 
             if (
@@ -23442,19 +26677,77 @@ namespace ConstructionAnimation.Systems
                 return;
             }
 
-            int cornerIndex;
-
-            Vector2 localCranePosition;
-
             if (
-                !TryGetCraneLotCorner(
-                    visual,
-                    out localCranePosition,
-                    out cornerIndex
-                )
+                !visual.CranePlacementCached
             )
             {
-                Vector2 center =
+                int cachedCornerIndex;
+
+                Vector2 cachedLocalCranePosition;
+
+                if (
+                    !SelectCraneLotCornerAvoidingNeighbours(
+                        visual,
+                        sourceTransform,
+                        out cachedLocalCranePosition,
+                        out cachedCornerIndex
+                    )
+                )
+                {
+                    Vector2 center =
+                        Vector2.zero;
+
+                    for (
+                        int i = 0;
+                        i < visual.Footprint.Count;
+                        i++
+                    )
+                    {
+                        center +=
+                            visual.Footprint[i];
+                    }
+
+                    center /=
+                        visual.Footprint.Count;
+
+                    cachedCornerIndex =
+                        Mathf.Clamp(
+                            CranePreferredCornerIndex,
+                            0,
+                            visual.Footprint.Count -
+                            1
+                        );
+
+                    Vector2 corner =
+                        visual.Footprint[
+                            cachedCornerIndex
+                        ];
+
+                    Vector2 outward =
+                        corner -
+                        center;
+
+                    if (
+                        outward.sqrMagnitude <
+                        0.001f
+                    )
+                    {
+                        outward =
+                            Vector2.right;
+                    }
+
+                    outward.Normalize();
+
+                    cachedLocalCranePosition =
+                        corner +
+                        outward *
+                        (
+                            ScaffoldMargin +
+                            0.75f
+                        );
+                }
+
+                Vector2 footprintCenter =
                     Vector2.zero;
 
                 for (
@@ -23463,46 +26756,54 @@ namespace ConstructionAnimation.Systems
                     i++
                 )
                 {
-                    center +=
+                    footprintCenter +=
                         visual.Footprint[i];
                 }
 
-                center /=
+                footprintCenter /=
                     visual.Footprint.Count;
 
-                cornerIndex =
-                    Math.Abs(
-                        visual.Source.Index
-                    ) %
-                    visual.Footprint.Count;
-
-                Vector2 corner =
-                    visual.Footprint[
-                        cornerIndex
-                    ];
-
-                Vector2 outward =
-                    corner -
-                    center;
+                Vector2 directionToCenter =
+                    footprintCenter -
+                    cachedLocalCranePosition;
 
                 if (
-                    outward.sqrMagnitude < 0.001f
+                    directionToCenter.sqrMagnitude <
+                    0.001f
                 )
                 {
-                    outward =
-                        Vector2.right;
+                    directionToCenter =
+                        Vector2.up;
                 }
 
-                outward.Normalize();
+                directionToCenter.Normalize();
 
-                localCranePosition =
-                    corner +
-                    outward *
-                    (
-                        ScaffoldMargin +
-                        0.75f
+                float localYaw =
+                    Mathf.Atan2(
+                        directionToCenter.x,
+                        directionToCenter.y
                     );
+
+                visual.CraneLocalPosition =
+                    cachedLocalCranePosition;
+
+                visual.CraneCornerIndex =
+                    cachedCornerIndex;
+
+                visual.CraneLocalRotation =
+                    quaternion.RotateY(
+                        localYaw
+                    );
+
+                visual.CranePlacementCached =
+                    true;
             }
+
+            Vector2 localCranePosition =
+                visual.CraneLocalPosition;
+
+            int cornerIndex =
+                visual.CraneCornerIndex;
 
             float3 rotatedOffset =
                 math.rotate(
@@ -23519,30 +26820,9 @@ namespace ConstructionAnimation.Systems
                     visual.CraneEntity
                 );
 
-            if (
-                !visual.CraneVerticalOffsetCaptured
-            )
-            {
-                visual.CraneVerticalOffset =
-                    craneTransform.m_Position.y -
-                    sourceTransform.m_Position.y;
-
-                visual.CraneVerticalOffsetCaptured =
-                    true;
-            }
-
-            if (
-                !visual.CraneUsingBackup &&
-                visual.CraneBackupEntity == Entity.Null
-            )
-            {
-                EnsureCraneBackup(
-                    visual,
-                    visual.CraneEntity,
-                    sourceTransform
-                );
-            }
-
+            // Keep the crane base fixed. The upper structure, trolley/cable
+            // and hook are animated by CS2's procedural bones from
+            // PointOfInterest, exactly like the vanilla construction crane.
             craneTransform.m_Position.x =
                 sourceTransform.m_Position.x +
                 rotatedOffset.x;
@@ -23554,6 +26834,12 @@ namespace ConstructionAnimation.Systems
             craneTransform.m_Position.z =
                 sourceTransform.m_Position.z +
                 rotatedOffset.z;
+
+            craneTransform.m_Rotation =
+                math.mul(
+                    sourceTransform.m_Rotation,
+                    visual.CraneLocalRotation
+                );
 
             EntityManager.SetComponentData(
                 visual.CraneEntity,
@@ -23571,25 +26857,397 @@ namespace ConstructionAnimation.Systems
                 );
             }
 
+            UpdateManagedCranePointOfInterest(
+                visual,
+                sourceTransform,
+                craneTransform
+            );
+
             if (
                 !visual.CranePositionLogged
             )
             {
-                ModLog.Info(
-                    $"V1.43.47.4.3.14 crane positioned " +
-                    $"building={visual.Source.Index}:{visual.Source.Version}; " +
-                    $"crane={visual.CraneEntity.Index}:{visual.CraneEntity.Version}; " +
-                    $"backup={visual.CraneUsingBackup}; " +
-                    $"corner={cornerIndex}; " +
-                    $"local=({localCranePosition.x:0.00}," +
-                    $"{localCranePosition.y:0.00}); " +
-                    $"verticalOffset={visual.CraneVerticalOffset:0.00}"
+                ModLog.Checkpoint(
+                    "CRANE managed visual active; building=" +
+                    visual.Source.Index +
+                    ":" +
+                    visual.Source.Version +
+                    "; crane=" +
+                    visual.CraneEntity.Index +
+                    ":" +
+                    visual.CraneEntity.Version +
+                    "; vanilla=" +
+                    visual.VanillaCraneEntity.Index +
+                    ":" +
+                    visual.VanillaCraneEntity.Version +
+                    "; corner=" +
+                    cornerIndex +
+                    "; animation=vanilla-PointOfInterest"
                 );
 
                 visual.CranePositionLogged =
                     true;
             }
         }
+
+        private void UpdateManagedCranePointOfInterest(
+            ConstructionVisual visual,
+            Game.Objects.Transform sourceTransform,
+            Game.Objects.Transform craneTransform
+        )
+        {
+            if (
+                visual == null ||
+                visual.CraneEntity == Entity.Null ||
+                !EntityManager.Exists(
+                    visual.CraneEntity
+                ) ||
+                m_SimulationSystem == null
+            )
+            {
+                return;
+            }
+
+            uint simulationFrame =
+                m_SimulationSystem.frameIndex;
+
+            if (
+                visual.CranePointOfInterestInitialized &&
+                simulationFrame <
+                visual.CraneNextPointOfInterestFrame
+            )
+            {
+                return;
+            }
+
+            float minX =
+                float.MaxValue;
+
+            float maxX =
+                float.MinValue;
+
+            float minZ =
+                float.MaxValue;
+
+            float maxZ =
+                float.MinValue;
+
+            for (
+                int i = 0;
+                i < visual.Footprint.Count;
+                i++
+            )
+            {
+                Vector2 point =
+                    visual.Footprint[i];
+
+                minX =
+                    Mathf.Min(
+                        minX,
+                        point.x
+                    );
+
+                maxX =
+                    Mathf.Max(
+                        maxX,
+                        point.x
+                    );
+
+                minZ =
+                    Mathf.Min(
+                        minZ,
+                        point.y
+                    );
+
+                maxZ =
+                    Mathf.Max(
+                        maxZ,
+                        point.y
+                    );
+            }
+
+            int sequence =
+                visual.CranePointOfInterestSequence;
+
+            Vector2 localTarget =
+                Vector2.zero;
+
+            bool foundInside =
+                false;
+
+            for (
+                int attempt = 0;
+                attempt < 8;
+                attempt++
+            )
+            {
+                int saltBase =
+                    1000 +
+                    sequence *
+                    31 +
+                    attempt *
+                    7;
+
+                Vector2 candidate =
+                    new Vector2(
+                        Mathf.Lerp(
+                            minX,
+                            maxX,
+                            DeterministicUnit(
+                                visual.Source.Index,
+                                saltBase + 1
+                            )
+                        ),
+                        Mathf.Lerp(
+                            minZ,
+                            maxZ,
+                            DeterministicUnit(
+                                visual.Source.Index,
+                                saltBase + 2
+                            )
+                        )
+                    );
+
+                if (
+                    IsPointInsidePolygon(
+                        candidate,
+                        visual.Footprint
+                    )
+                )
+                {
+                    localTarget =
+                        candidate;
+
+                    foundInside =
+                        true;
+
+                    break;
+                }
+            }
+
+            if (
+                !foundInside
+            )
+            {
+                for (
+                    int i = 0;
+                    i < visual.Footprint.Count;
+                    i++
+                )
+                {
+                    localTarget +=
+                        visual.Footprint[i];
+                }
+
+                localTarget /=
+                    visual.Footprint.Count;
+            }
+
+            float localTargetY =
+                Mathf.Lerp(
+                    Mathf.Max(
+                        1f,
+                        visual.BuildingHeight *
+                        0.10f
+                    ),
+                    Mathf.Max(
+                        2f,
+                        visual.BuildingHeight *
+                        0.90f
+                    ),
+                    DeterministicUnit(
+                        visual.Source.Index,
+                        2000 +
+                        sequence * 37
+                    )
+                );
+
+            float3 worldTarget =
+                sourceTransform.m_Position +
+                math.rotate(
+                    sourceTransform.m_Rotation,
+                    new float3(
+                        localTarget.x,
+                        localTargetY,
+                        localTarget.y
+                    )
+                );
+
+            // Vanilla BuildingConstructionSystem clamps the horizontal target
+            // distance using CraneData.m_DistanceRange. Apply the same rule
+            // after moving the crane away from its original centre-lot point.
+            if (
+                EntityManager.HasComponent<PrefabRef>(
+                    visual.CraneEntity
+                )
+            )
+            {
+                PrefabRef cranePrefabRef =
+                    EntityManager.GetComponentData<PrefabRef>(
+                        visual.CraneEntity
+                    );
+
+                if (
+                    cranePrefabRef.m_Prefab !=
+                    Entity.Null &&
+                    EntityManager.Exists(
+                        cranePrefabRef.m_Prefab
+                    ) &&
+                    EntityManager.HasComponent<CraneData>(
+                        cranePrefabRef.m_Prefab
+                    )
+                )
+                {
+                    CraneData craneData =
+                        EntityManager.GetComponentData<CraneData>(
+                            cranePrefabRef.m_Prefab
+                        );
+
+                    float3 localFromCrane =
+                        math.rotate(
+                            math.inverse(
+                                craneTransform.m_Rotation
+                            ),
+                            worldTarget -
+                            craneTransform.m_Position
+                        );
+
+                    float horizontalDistance =
+                        math.length(
+                            localFromCrane.xz
+                        );
+
+                    if (
+                        horizontalDistance <
+                        craneData.m_DistanceRange.min
+                    )
+                    {
+                        localFromCrane.xz =
+                            math.normalizesafe(
+                                localFromCrane.xz,
+                                new float2(
+                                    0f,
+                                    1f
+                                )
+                            ) *
+                            craneData.m_DistanceRange.min;
+                    }
+                    else if (
+                        horizontalDistance >
+                        craneData.m_DistanceRange.max
+                    )
+                    {
+                        localFromCrane.xz =
+                            math.normalizesafe(
+                                localFromCrane.xz,
+                                new float2(
+                                    0f,
+                                    1f
+                                )
+                            ) *
+                            craneData.m_DistanceRange.max;
+                    }
+
+                    worldTarget =
+                        craneTransform.m_Position +
+                        math.rotate(
+                            craneTransform.m_Rotation,
+                            localFromCrane
+                        );
+                }
+            }
+
+            PointOfInterest pointOfInterest;
+
+            if (
+                EntityManager.HasComponent<PointOfInterest>(
+                    visual.CraneEntity
+                )
+            )
+            {
+                pointOfInterest =
+                    EntityManager.GetComponentData<PointOfInterest>(
+                        visual.CraneEntity
+                    );
+            }
+            else
+            {
+                pointOfInterest =
+                    default(PointOfInterest);
+            }
+
+            pointOfInterest.m_Position =
+                worldTarget;
+
+            pointOfInterest.m_IsValid =
+                true;
+
+            if (
+                EntityManager.HasComponent<PointOfInterest>(
+                    visual.CraneEntity
+                )
+            )
+            {
+                EntityManager.SetComponentData(
+                    visual.CraneEntity,
+                    pointOfInterest
+                );
+            }
+            else
+            {
+                EntityManager.AddComponentData(
+                    visual.CraneEntity,
+                    pointOfInterest
+                );
+            }
+
+            visual.CranePointOfInterestInitialized =
+                true;
+
+            visual.CranePointOfInterestSequence =
+                sequence +
+                1;
+
+            uint interval =
+                (uint)Mathf.RoundToInt(
+                    Mathf.Lerp(
+                        CraneTargetMinimumIntervalFrames,
+                        CraneTargetMaximumIntervalFrames,
+                        DeterministicUnit(
+                            visual.Source.Index,
+                            3000 +
+                            sequence * 43
+                        )
+                    )
+                );
+
+            visual.CraneNextPointOfInterestFrame =
+                simulationFrame +
+                interval;
+
+            ModLog.Checkpoint(
+                "CRANE POI target; building=" +
+                visual.Source.Index +
+                ":" +
+                visual.Source.Version +
+                "; crane=" +
+                visual.CraneEntity.Index +
+                ":" +
+                visual.CraneEntity.Version +
+                "; frame=" +
+                simulationFrame +
+                "; nextFrame=" +
+                visual.CraneNextPointOfInterestFrame +
+                "; target=(" +
+                worldTarget.x.ToString("0.00") +
+                "," +
+                worldTarget.y.ToString("0.00") +
+                "," +
+                worldTarget.z.ToString("0.00") +
+                ")"
+            );
+        }
+
 
         private bool IsCraneEligible(
             ConstructionVisual visual,
@@ -23696,7 +27354,7 @@ namespace ConstructionAnimation.Systems
                 );
         }
 
-        private void EnsureCraneBackup(
+        private void EnsureManagedCraneVisual(
             ConstructionVisual visual,
             Entity sourceCrane,
             Game.Objects.Transform sourceTransform
@@ -23704,7 +27362,9 @@ namespace ConstructionAnimation.Systems
         {
             if (
                 visual == null ||
-                visual.CraneBackupEntity != Entity.Null ||
+                IsUsableCraneEntity(
+                    visual.CraneEntity
+                ) ||
                 !IsUsableCraneEntity(
                     sourceCrane
                 )
@@ -23715,74 +27375,57 @@ namespace ConstructionAnimation.Systems
 
             try
             {
-                Entity backup =
+                Entity managedCrane =
                     EntityManager.Instantiate(
                         sourceCrane
                     );
 
-                if (
-                    EntityManager.HasComponent<Owner>(
-                        backup
-                    )
-                )
-                {
-                    EntityManager.RemoveComponent<Owner>(
-                        backup
-                    );
-                }
+                StripCraneGameplayComponents(
+                    managedCrane
+                );
 
-                if (
-                    EntityManager.HasComponent<Deleted>(
-                        backup
-                    )
-                )
-                {
-                    EntityManager.RemoveComponent<Deleted>(
-                        backup
-                    );
-                }
-
-                if (
-                    EntityManager.HasComponent<Game.Tools.Hidden>(
-                        backup
-                    )
-                )
-                {
-                    EntityManager.RemoveComponent<Game.Tools.Hidden>(
-                        backup
-                    );
-                }
-
-                Game.Objects.Transform backupTransform =
+                Game.Objects.Transform managedTransform =
                     EntityManager.GetComponentData<Game.Objects.Transform>(
-                        backup
+                        managedCrane
                     );
 
-                backupTransform.m_Position.y =
+                managedTransform.m_Position.y =
                     sourceTransform.m_Position.y -
                     CraneBackupParkDepth;
 
                 EntityManager.SetComponentData(
-                    backup,
-                    backupTransform
+                    managedCrane,
+                    managedTransform
                 );
 
                 if (
                     !EntityManager.HasComponent<Updated>(
-                        backup
+                        managedCrane
                     )
                 )
                 {
                     EntityManager.AddComponent<Updated>(
-                        backup
+                        managedCrane
                     );
                 }
 
-                visual.CraneBackupEntity =
-                    backup;
+                visual.CraneEntity =
+                    managedCrane;
+
+                visual.CranePositionLogged =
+                    false;
+
+                visual.CranePointOfInterestInitialized =
+                    false;
+
+                visual.CraneNextPointOfInterestFrame =
+                    0u;
+
+                visual.CranePointOfInterestSequence =
+                    0;
 
                 ModLog.Checkpoint(
-                    "CRANE backup created; building=" +
+                    "CRANE managed visual created; building=" +
                     visual.Source.Index +
                     ":" +
                     visual.Source.Version +
@@ -23790,16 +27433,16 @@ namespace ConstructionAnimation.Systems
                     sourceCrane.Index +
                     ":" +
                     sourceCrane.Version +
-                    "; backup=" +
-                    backup.Index +
+                    "; managedCrane=" +
+                    managedCrane.Index +
                     ":" +
-                    backup.Version
+                    managedCrane.Version
                 );
             }
             catch (Exception ex)
             {
                 ModLog.Error(
-                    "CRANE backup creation failed; building=" +
+                    "CRANE managed visual creation failed; building=" +
                     visual.Source.Index +
                     ":" +
                     visual.Source.Version +
@@ -23811,16 +27454,70 @@ namespace ConstructionAnimation.Systems
             }
         }
 
-        private void ParkIneligibleVanillaCrane(
-            ConstructionVisual visual,
+        private void StripCraneGameplayComponents(
+            Entity crane
+        )
+        {
+            if (
+                crane == Entity.Null ||
+                !EntityManager.Exists(
+                    crane
+                )
+            )
+            {
+                return;
+            }
+
+            if (
+                EntityManager.HasComponent<Owner>(
+                    crane
+                )
+            )
+            {
+                EntityManager.RemoveComponent<Owner>(
+                    crane
+                );
+            }
+
+            if (
+                EntityManager.HasComponent<Game.Objects.Crane>(
+                    crane
+                )
+            )
+            {
+                EntityManager.RemoveComponent<Game.Objects.Crane>(
+                    crane
+                );
+            }
+
+            if (
+                EntityManager.HasComponent<Deleted>(
+                    crane
+                )
+            )
+            {
+                EntityManager.RemoveComponent<Deleted>(
+                    crane
+                );
+            }
+
+            if (
+                EntityManager.HasComponent<Game.Tools.Hidden>(
+                    crane
+                )
+            )
+            {
+                EntityManager.RemoveComponent<Game.Tools.Hidden>(
+                    crane
+                );
+            }
+        }
+
+        private void ParkVanillaCraneEntity(
+            Entity crane,
             Game.Objects.Transform sourceTransform
         )
         {
-            Entity crane =
-                FindCraneSubObject(
-                    visual.Source
-                );
-
             if (
                 crane == Entity.Null ||
                 !EntityManager.Exists(
@@ -23858,35 +27555,51 @@ namespace ConstructionAnimation.Systems
                     crane
                 );
             }
+        }
+
+        private void ParkIneligibleVanillaCrane(
+            ConstructionVisual visual,
+            Game.Objects.Transform sourceTransform
+        )
+        {
+            Entity crane =
+                FindCraneSubObject(
+                    visual.Source
+                );
+
+            ParkVanillaCraneEntity(
+                crane,
+                sourceTransform
+            );
 
             visual.CraneEntity =
                 Entity.Null;
         }
 
-        private void DestroyManagedCraneBackup(
+        private void DestroyManagedCraneVisual(
             ConstructionVisual visual
         )
         {
             if (
                 visual == null ||
-                visual.CraneBackupEntity == Entity.Null
+                visual.CraneEntity == Entity.Null
             )
             {
                 return;
             }
 
-            Entity backup =
-                visual.CraneBackupEntity;
+            Entity managedCrane =
+                visual.CraneEntity;
 
-            visual.CraneBackupEntity =
+            visual.CraneEntity =
                 Entity.Null;
 
-            visual.CraneUsingBackup =
-                false;
+            visual.VanillaCraneEntity =
+                Entity.Null;
 
             if (
                 !EntityManager.Exists(
-                    backup
+                    managedCrane
                 )
             )
             {
@@ -23894,12 +27607,13 @@ namespace ConstructionAnimation.Systems
             }
 
             ScheduleNativeProxyDestroy(
-                backup
+                managedCrane
             );
         }
 
-        private static bool TryGetCraneLotCorner(
+        private bool SelectCraneLotCornerAvoidingNeighbours(
             ConstructionVisual visual,
+            Game.Objects.Transform sourceTransform,
             out Vector2 localPosition,
             out int cornerIndex
         )
@@ -23971,28 +27685,142 @@ namespace ConstructionAnimation.Systems
                     )
                 };
 
-            int startIndex =
-                Math.Abs(
-                    visual.Source.Index
-                ) %
-                candidates.Length;
+            List<Vector2> nearbyCranePositions =
+                new List<Vector2>();
 
-            float bestClearanceSquared =
-                float.MinValue;
+            float neighbourSearchRadius =
+                CraneNeighbourSafetyRadius *
+                2f;
 
-            for (
-                int offset = 0;
-                offset < candidates.Length;
-                offset++
+            float neighbourSearchRadiusSquared =
+                neighbourSearchRadius *
+                neighbourSearchRadius;
+
+            Vector2 sourceWorldCenter =
+                new Vector2(
+                    sourceTransform.m_Position.x,
+                    sourceTransform.m_Position.z
+                );
+
+            foreach (
+                KeyValuePair<Entity, ConstructionVisual> pair
+                in m_Visuals
             )
             {
-                int candidateIndex =
-                    (
-                        startIndex +
-                        offset
-                    ) %
-                    candidates.Length;
+                ConstructionVisual other =
+                    pair.Value;
 
+                if (
+                    other == null ||
+                    other == visual ||
+                    other.CraneEntity == Entity.Null ||
+                    !EntityManager.Exists(
+                        other.CraneEntity
+                    ) ||
+                    !EntityManager.HasComponent<Game.Objects.Transform>(
+                        other.CraneEntity
+                    )
+                )
+                {
+                    continue;
+                }
+
+                Game.Objects.Transform otherCraneTransform =
+                    EntityManager.GetComponentData<Game.Objects.Transform>(
+                        other.CraneEntity
+                    );
+
+                Vector2 otherWorld =
+                    new Vector2(
+                        otherCraneTransform.m_Position.x,
+                        otherCraneTransform.m_Position.z
+                    );
+
+                if (
+                    (
+                        otherWorld -
+                        sourceWorldCenter
+                    ).sqrMagnitude <=
+                    neighbourSearchRadiusSquared
+                )
+                {
+                    nearbyCranePositions.Add(
+                        otherWorld
+                    );
+                }
+            }
+
+            // With no nearby crane, every construction uses the same preferred
+            // corner whenever that corner is geometrically valid.
+            if (
+                nearbyCranePositions.Count == 0
+            )
+            {
+                for (
+                    int preferenceOffset = 0;
+                    preferenceOffset < candidates.Length;
+                    preferenceOffset++
+                )
+                {
+                    int candidateIndex =
+                        (
+                            CranePreferredCornerIndex +
+                            preferenceOffset
+                        ) %
+                        candidates.Length;
+
+                    Vector2 candidate =
+                        candidates[
+                            candidateIndex
+                        ];
+
+                    if (
+                        IsPointInsidePolygon(
+                            candidate,
+                            visual.Footprint
+                        )
+                    )
+                    {
+                        continue;
+                    }
+
+                    localPosition =
+                        candidate;
+
+                    cornerIndex =
+                        candidateIndex;
+
+                    ModLog.Checkpoint(
+                        "CRANE corner-selection; building=" +
+                        visual.Source.Index +
+                        ":" +
+                        visual.Source.Version +
+                        "; corner=" +
+                        cornerIndex +
+                        "; nearby=False; nearest=n/a"
+                    );
+
+                    return true;
+                }
+
+                return false;
+            }
+
+            float bestNeighbourDistanceSquared =
+                float.MinValue;
+
+            float bestFootprintClearanceSquared =
+                float.MinValue;
+
+            int bestPreferenceRank =
+                int.MaxValue;
+
+            for (
+                int candidateIndex = 0;
+                candidateIndex < candidates.Length;
+                candidateIndex++
+            )
+            {
                 Vector2 candidate =
                     candidates[
                         candidateIndex
@@ -24008,7 +27836,7 @@ namespace ConstructionAnimation.Systems
                     continue;
                 }
 
-                float clearanceSquared =
+                float footprintClearanceSquared =
                     float.MaxValue;
 
                 for (
@@ -24031,9 +27859,9 @@ namespace ConstructionAnimation.Systems
                             visual.Footprint.Count
                         ];
 
-                    clearanceSquared =
+                    footprintClearanceSquared =
                         Mathf.Min(
-                            clearanceSquared,
+                            footprintClearanceSquared,
                             DistanceSquaredToSegment(
                                 candidate,
                                 edgeStart,
@@ -24042,13 +27870,106 @@ namespace ConstructionAnimation.Systems
                         );
                 }
 
-                if (
-                    clearanceSquared >
-                    bestClearanceSquared
+                float3 rotatedOffset =
+                    math.rotate(
+                        sourceTransform.m_Rotation,
+                        new float3(
+                            candidate.x,
+                            0f,
+                            candidate.y
+                        )
+                    );
+
+                Vector2 candidateWorld =
+                    new Vector2(
+                        sourceTransform.m_Position.x +
+                        rotatedOffset.x,
+                        sourceTransform.m_Position.z +
+                        rotatedOffset.z
+                    );
+
+                float nearestNeighbourDistanceSquared =
+                    float.MaxValue;
+
+                for (
+                    int neighbourIndex = 0;
+                    neighbourIndex < nearbyCranePositions.Count;
+                    neighbourIndex++
                 )
                 {
-                    bestClearanceSquared =
-                        clearanceSquared;
+                    float distanceSquared =
+                        (
+                            candidateWorld -
+                            nearbyCranePositions[
+                                neighbourIndex
+                            ]
+                        ).sqrMagnitude;
+
+                    nearestNeighbourDistanceSquared =
+                        Mathf.Min(
+                            nearestNeighbourDistanceSquared,
+                            distanceSquared
+                        );
+                }
+
+                int preferenceRank =
+                    (
+                        candidateIndex -
+                        CranePreferredCornerIndex +
+                        candidates.Length
+                    ) %
+                    candidates.Length;
+
+                bool better =
+                    nearestNeighbourDistanceSquared >
+                    bestNeighbourDistanceSquared +
+                    0.001f;
+
+                if (
+                    !better &&
+                    Mathf.Abs(
+                        nearestNeighbourDistanceSquared -
+                        bestNeighbourDistanceSquared
+                    ) <=
+                    0.001f
+                )
+                {
+                    if (
+                        footprintClearanceSquared >
+                        bestFootprintClearanceSquared +
+                        0.001f
+                    )
+                    {
+                        better =
+                            true;
+                    }
+                    else if (
+                        Mathf.Abs(
+                            footprintClearanceSquared -
+                            bestFootprintClearanceSquared
+                        ) <=
+                        0.001f &&
+                        preferenceRank <
+                        bestPreferenceRank
+                    )
+                    {
+                        better =
+                            true;
+                    }
+                }
+
+                if (
+                    better
+                )
+                {
+                    bestNeighbourDistanceSquared =
+                        nearestNeighbourDistanceSquared;
+
+                    bestFootprintClearanceSquared =
+                        footprintClearanceSquared;
+
+                    bestPreferenceRank =
+                        preferenceRank;
 
                     localPosition =
                         candidate;
@@ -24056,6 +27977,32 @@ namespace ConstructionAnimation.Systems
                     cornerIndex =
                         candidateIndex;
                 }
+            }
+
+            if (
+                cornerIndex >= 0
+            )
+            {
+                ModLog.Checkpoint(
+                    "CRANE corner-selection; building=" +
+                    visual.Source.Index +
+                    ":" +
+                    visual.Source.Version +
+                    "; corner=" +
+                    cornerIndex +
+                    "; nearby=True; neighbours=" +
+                    nearbyCranePositions.Count +
+                    "; nearest=" +
+                    Mathf.Sqrt(
+                        Mathf.Max(
+                            0f,
+                            bestNeighbourDistanceSquared
+                        )
+                    ).ToString("0.0") +
+                    "m; safety=" +
+                    CraneNeighbourSafetyRadius.ToString("0") +
+                    "m"
+                );
             }
 
             return
@@ -28591,8 +32538,18 @@ namespace ConstructionAnimation.Systems
                 visual
             );
 
+            long perfTerrainStart =
+                PerfTimestamp();
+
             ClearPublishedTerrainDirt(
                 visual
+            );
+
+            PerfAdd(
+                ref m_PerfTerrainTicks,
+                ref m_PerfTerrainMaxTicks,
+                ref m_PerfTerrainCalls,
+                perfTerrainStart
             );
 
             RestoreVanillaSandSurfaces(
@@ -28607,7 +32564,7 @@ namespace ConstructionAnimation.Systems
                 visual
             );
 
-            DestroyManagedCraneBackup(
+            DestroyManagedCraneVisual(
                 visual
             );
 
@@ -28661,6 +32618,9 @@ namespace ConstructionAnimation.Systems
                 );
             }
 
+            HashSet<Mesh> uniqueScaffoldMeshes =
+                new HashSet<Mesh>();
+
             for (
                 int i = 0;
                 i < visual.ScaffoldMeshes.Count;
@@ -28672,7 +32632,10 @@ namespace ConstructionAnimation.Systems
 
                 if (
                     scaffoldMesh ==
-                    null
+                    null ||
+                    !uniqueScaffoldMeshes.Add(
+                        scaffoldMesh
+                    )
                 )
                 {
                     continue;
@@ -28747,6 +32710,9 @@ namespace ConstructionAnimation.Systems
 
             visual.NextScaffoldDistanceCheckTime =
                 0f;
+
+            visual.ScaffoldLodStep =
+                1;
 
             visual.ScaffoldFullyRevealedCount =
                 0;
@@ -29105,6 +33071,10 @@ namespace ConstructionAnimation.Systems
 
         protected override void OnDestroy()
         {
+            WritePerformanceReportIfDue(
+                true
+            );
+
             foreach (
                 ConstructionVisual visual
                 in m_Visuals.Values
@@ -29115,7 +33085,8 @@ namespace ConstructionAnimation.Systems
                 );
 
                 ClearPublishedTerrainDirt(
-                    visual
+                    visual,
+                    true
                 );
 
                 RestoreVanillaSandSurfaces(
@@ -29155,6 +33126,8 @@ namespace ConstructionAnimation.Systems
             }
 
             m_Visuals.Clear();
+            m_PrefabGeometryCache.Clear();
+            m_CutoffPrefabTemplateCache.Clear();
 
             for (
                 int i = 0;
